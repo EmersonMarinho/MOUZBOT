@@ -24,6 +24,9 @@ MONGODB_DB_NAME = os.getenv('MONGODB_DB_NAME', 'bdo_gearscore')
 ALLOWED_DM_ROLES = os.getenv('ALLOWED_DM_ROLES', '').split(',') if os.getenv('ALLOWED_DM_ROLES') else []
 ALLOWED_DM_ROLES = [role_id.strip() for role_id in ALLOWED_DM_ROLES if role_id.strip()]
 
+# ID do canal para notificações de registro/atualização
+NOTIFICATION_CHANNEL_ID = 1442347196103004242
+
 # Lista de classes do Black Desert Online
 BDO_CLASSES = [
     "Warrior",

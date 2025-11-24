@@ -2,7 +2,7 @@ import discord
 from discord import app_commands
 from discord.ext import commands
 import os
-from config import DISCORD_TOKEN, BDO_CLASSES, DATABASE_NAME, DATABASE_URL, ALLOWED_DM_ROLES
+from config import DISCORD_TOKEN, BDO_CLASSES, DATABASE_NAME, DATABASE_URL, ALLOWED_DM_ROLES, NOTIFICATION_CHANNEL_ID
 # Importar o banco de dados apropriado
 if DATABASE_URL:
     from database_postgres import Database
@@ -35,6 +35,45 @@ db = Database()
 def calculate_gs(ap, aap, dp):
     """Calcula o Gearscore: maior entre AP ou AAP + DP"""
     return max(ap, aap) + dp
+
+# Função helper para enviar notificação ao canal
+async def send_notification_to_channel(bot, interaction, action_type, nome_familia, classe_pvp, ap, aap, dp, linkgear):
+    """Envia notificação de registro/atualização para o canal especificado"""
+    try:
+        channel = bot.get_channel(NOTIFICATION_CHANNEL_ID)
+        if not channel:
+            # Tentar buscar o canal se não estiver em cache
+            channel = await bot.fetch_channel(NOTIFICATION_CHANNEL_ID)
+        
+        if channel:
+            gs_total = calculate_gs(ap, aap, dp)
+            
+            if action_type == "registro":
+                title = "✅ Novo Gearscore Registrado!"
+                color = discord.Color.green()
+            else:  # atualizar
+                title = "🔄 Gearscore Atualizado!"
+                color = discord.Color.blue()
+            
+            embed = discord.Embed(
+                title=title,
+                color=color,
+                timestamp=discord.utils.utcnow()
+            )
+            embed.add_field(name="👤 Usuário", value=interaction.user.mention, inline=True)
+            embed.add_field(name="👤 Família", value=nome_familia, inline=True)
+            embed.add_field(name="🎭 Classe PVP", value=classe_pvp, inline=True)
+            embed.add_field(name="⚔️ AP", value=f"{ap}", inline=True)
+            embed.add_field(name="🔥 AAP", value=f"{aap}", inline=True)
+            embed.add_field(name="🛡️ DP", value=f"{dp}", inline=True)
+            embed.add_field(name="📊 GS Total", value=f"**{gs_total}** (MAX({ap}, {aap}) + {dp})", inline=False)
+            embed.add_field(name="🔗 Link Gear", value=linkgear, inline=False)
+            embed.set_footer(text=f"{action_type.capitalize()} por {interaction.user.display_name}")
+            
+            await channel.send(embed=embed)
+    except Exception as e:
+        # Não interromper o fluxo principal se houver erro ao enviar notificação
+        print(f"Erro ao enviar notificação ao canal: {str(e)}")
 
 @bot.event
 async def on_ready():
@@ -179,6 +218,12 @@ async def registro(
         embed.set_footer(text=f"Registrado por {interaction.user.display_name}")
         
         await interaction.followup.send(embed=embed, ephemeral=True)
+        
+        # Enviar notificação ao canal
+        await send_notification_to_channel(
+            bot, interaction, "registro", 
+            nome_familia, classe_pvp, ap, aap, dp, linkgear
+        )
     except ValueError as e:
         # Verificar se já respondeu
         if interaction.response.is_done():
@@ -300,6 +345,12 @@ async def atualizar(
         embed.set_footer(text=f"Atualizado por {interaction.user.display_name}")
         
         await interaction.followup.send(embed=embed, ephemeral=True)
+        
+        # Enviar notificação ao canal
+        await send_notification_to_channel(
+            bot, interaction, "atualizar", 
+            nome_familia, classe_pvp, ap, aap, dp, linkgear
+        )
     except Exception as e:
         # Verificar se já respondeu (defer foi chamado)
         if interaction.response.is_done():
