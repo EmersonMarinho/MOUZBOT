@@ -148,8 +148,8 @@ async def registro(
     try:
         user_id = str(interaction.user.id)
         
-        # Deferir resposta se a operação pode demorar
-        await interaction.response.defer(ephemeral=False)
+        # Deferir resposta se a operação pode demorar (privado)
+        await interaction.response.defer(ephemeral=True)
         
         db.register_gearscore(
             user_id=user_id,
@@ -178,7 +178,7 @@ async def registro(
         embed.add_field(name="🔗 Link Gear", value=linkgear, inline=False)
         embed.set_footer(text=f"Registrado por {interaction.user.display_name}")
         
-        await interaction.followup.send(embed=embed)
+        await interaction.followup.send(embed=embed, ephemeral=True)
     except ValueError as e:
         # Verificar se já respondeu
         if interaction.response.is_done():
@@ -260,8 +260,8 @@ async def atualizar(
             )
             return
         
-        # Deferir resposta antes de operações que podem demorar
-        await interaction.response.defer(ephemeral=False)
+        # Deferir resposta antes de operações que podem demorar (privado)
+        await interaction.response.defer(ephemeral=True)
         
         # Atualizar gearscore (pode demorar com banco de dados)
         db.update_gearscore(
@@ -299,7 +299,7 @@ async def atualizar(
         
         embed.set_footer(text=f"Atualizado por {interaction.user.display_name}")
         
-        await interaction.followup.send(embed=embed)
+        await interaction.followup.send(embed=embed, ephemeral=True)
     except Exception as e:
         # Verificar se já respondeu (defer foi chamado)
         if interaction.response.is_done():
@@ -364,7 +364,7 @@ async def ver_gearscore(interaction: discord.Interaction):
         embed.add_field(name="🔗 Link Gear", value=linkgear, inline=False)
         embed.set_footer(text=f"Última atualização: {updated_at}")
         
-        await interaction.response.send_message(embed=embed)
+        await interaction.response.send_message(embed=embed, ephemeral=True)
             
     except Exception as e:
         await interaction.response.send_message(
@@ -649,6 +649,7 @@ async def dm_cargo(interaction: discord.Interaction, cargos: str, mensagem: str)
         
         sent = 0
         failed = 0
+        blocked_members = []  # Lista de quem não recebeu
         
         for member in members_with_roles:
             try:
@@ -656,15 +657,62 @@ async def dm_cargo(interaction: discord.Interaction, cargos: str, mensagem: str)
                 sent += 1
             except discord.Forbidden:
                 failed += 1
+                blocked_members.append(member)
             except Exception:
                 failed += 1
+                blocked_members.append(member)
         
+        # Criar relatório detalhado
         role_mentions = ', '.join([role.mention for role in roles])
-        await interaction.followup.send(
-            f"✅ DM enviada para **{sent}** membro(s) com os cargos: {role_mentions}\n"
-            f"❌ Falhou para **{failed}** membro(s) (DMs desabilitadas ou bot bloqueado)",
-            ephemeral=True
+        report_embed = discord.Embed(
+            title="📊 Relatório de Envio de DMs",
+            description=f"Resultado do envio para membros com os cargos: {role_mentions}",
+            color=discord.Color.blue(),
+            timestamp=discord.utils.utcnow()
         )
+        
+        report_embed.add_field(
+            name="✅ Enviadas com Sucesso",
+            value=f"**{sent}** membro(s) receberam a DM",
+            inline=True
+        )
+        
+        report_embed.add_field(
+            name="❌ Não Receberam",
+            value=f"**{failed}** membro(s) não receberam (DMs desabilitadas ou bot bloqueado)",
+            inline=True
+        )
+        
+        # Lista de quem não recebeu
+        if blocked_members:
+            blocked_list = ""
+            for member in blocked_members[:50]:  # Limite de 50 para não exceder
+                blocked_list += f"• {member.mention} ({member.display_name})\n"
+            
+            if len(blocked_members) > 50:
+                blocked_list += f"\n... e mais {len(blocked_members) - 50} membro(s)"
+            
+            # Dividir em chunks se necessário (limite de 1024 caracteres por field)
+            if len(blocked_list) > 1024:
+                # Dividir a lista
+                chunks = [blocked_list[i:i+1024] for i in range(0, len(blocked_list), 1024)]
+                for i, chunk in enumerate(chunks):
+                    field_name = "🚫 Membros que Não Receberam" if i == 0 else f"🚫 Membros que Não Receberam (cont.)"
+                    report_embed.add_field(
+                        name=field_name,
+                        value=chunk,
+                        inline=False
+                    )
+            else:
+                report_embed.add_field(
+                    name="🚫 Membros que Não Receberam a DM",
+                    value=blocked_list,
+                    inline=False
+                )
+        
+        report_embed.set_footer(text=f"Envio executado por {interaction.user.display_name}")
+        
+        await interaction.followup.send(embed=report_embed, ephemeral=True)
     except Exception as e:
         await interaction.followup.send(
             f"❌ Erro ao enviar DMs: {str(e)}",
