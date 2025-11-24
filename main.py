@@ -2,7 +2,10 @@ import discord
 from discord import app_commands
 from discord.ext import commands
 import os
-from config import DISCORD_TOKEN, BDO_CLASSES, DATABASE_NAME, DATABASE_URL, ALLOWED_DM_ROLES, NOTIFICATION_CHANNEL_ID, GUILD_MEMBER_ROLE_ID
+import io
+from datetime import datetime
+from pytz import timezone
+from config import DISCORD_TOKEN, BDO_CLASSES, DATABASE_NAME, DATABASE_URL, ALLOWED_DM_ROLES, NOTIFICATION_CHANNEL_ID, GUILD_MEMBER_ROLE_ID, DM_REPORT_CHANNEL_ID, LIST_CHANNEL_ID, MOVE_LOG_CHANNEL_ID
 # Importar o banco de dados apropriado
 if DATABASE_URL:
     from database_postgres import Database
@@ -99,6 +102,76 @@ async def send_notification_to_channel(bot, interaction, action_type, nome_famil
         # Não interromper o fluxo principal se houver erro ao enviar notificação
         print(f"Erro ao enviar notificação ao canal: {str(e)}")
 
+# Função helper para enviar log de movimentação de membros
+async def send_move_log_to_channel(bot, interaction, origin_channel, destination_channel, moved_count, failed_count, failed_members):
+    """Envia log de movimentação de membros para o canal de logs"""
+    try:
+        channel = bot.get_channel(MOVE_LOG_CHANNEL_ID)
+        if not channel:
+            # Tentar buscar o canal se não estiver em cache
+            channel = await bot.fetch_channel(MOVE_LOG_CHANNEL_ID)
+        
+        if channel:
+            embed = discord.Embed(
+                title="🔄 Log de Movimentação de Membros",
+                description="Registro de movimentação entre salas de voz",
+                color=discord.Color.blue(),
+                timestamp=discord.utils.utcnow()
+            )
+            
+            embed.add_field(
+                name="👤 Executado por",
+                value=f"{interaction.user.mention} ({interaction.user.display_name})",
+                inline=False
+            )
+            
+            embed.add_field(
+                name="📤 Sala de Origem",
+                value=f"{origin_channel.mention}\n**ID:** {origin_channel.id}\n**Nome:** {origin_channel.name}",
+                inline=True
+            )
+            
+            embed.add_field(
+                name="📥 Sala de Destino",
+                value=f"{destination_channel.mention}\n**ID:** {destination_channel.id}\n**Nome:** {destination_channel.name}",
+                inline=True
+            )
+            
+            embed.add_field(
+                name="✅ Membros Movidos",
+                value=f"**{moved_count}** membro(s) movidos com sucesso",
+                inline=True
+            )
+            
+            if failed_count > 0:
+                embed.add_field(
+                    name="❌ Falhas",
+                    value=f"**{failed_count}** membro(s) não puderam ser movidos",
+                    inline=True
+                )
+                
+                # Lista de falhas (limitada a 10 para não exceder limite do embed)
+                if failed_members:
+                    failed_list = ""
+                    for member, reason in failed_members[:10]:
+                        failed_list += f"• {member.mention} ({member.display_name}) - {reason}\n"
+                    
+                    if len(failed_members) > 10:
+                        failed_list += f"\n... e mais {len(failed_members) - 10} membro(s)"
+                    
+                    embed.add_field(
+                        name="🚫 Membros que Falharam",
+                        value=failed_list,
+                        inline=False
+                    )
+            
+            embed.set_footer(text=f"Log gerado automaticamente")
+            
+            await channel.send(embed=embed)
+    except Exception as e:
+        # Não interromper o fluxo principal se houver erro ao enviar log
+        print(f"Erro ao enviar log de movimentação ao canal: {str(e)}")
+
 @bot.event
 async def on_ready():
     print(f'{bot.user} está online!')
@@ -129,7 +202,7 @@ async def on_message(message: discord.Message):
                       "`/ver_gearscore` - Visualiza seu gearscore\n"
                       "`/gearscore_dm` - Recebe gearscore via DM\n"
                       "`/ranking_gearscore` - Ver ranking\n"
-                      "`/classes_bdo` - Lista de classes",
+                      "`/estatisticas_classes` - Estatísticas das classes",
                 inline=False
             )
             embed.add_field(
@@ -483,9 +556,9 @@ async def ver_gearscore(interaction: discord.Interaction):
             ephemeral=True
         )
 
-@bot.tree.command(name="classes_bdo", description="[ADMIN] Mostra estatísticas das classes na guilda")
+@bot.tree.command(name="estatisticas_classes", description="[ADMIN] Mostra estatísticas das classes na guilda")
 @app_commands.default_permissions(administrator=True)
-async def classes_bdo(interaction: discord.Interaction):
+async def estatisticas_classes(interaction: discord.Interaction):
     """Mostra estatísticas das classes na guilda (apenas administradores)"""
     if not interaction.user.guild_permissions.administrator:
         await interaction.response.send_message(
@@ -568,8 +641,17 @@ async def classes_bdo(interaction: discord.Interaction):
             ephemeral=True
         )
 
-@bot.tree.command(name="ranking_gearscore", description="Mostra o ranking de gearscore")
+@bot.tree.command(name="ranking_gearscore", description="[ADMIN] Mostra o ranking de gearscore")
+@app_commands.default_permissions(administrator=True)
 async def ranking_gearscore(interaction: discord.Interaction):
+    """Mostra o ranking de gearscore (apenas administradores)"""
+    if not interaction.user.guild_permissions.administrator:
+        await interaction.response.send_message(
+            "❌ Apenas administradores podem usar este comando!",
+            ephemeral=True
+        )
+        return
+    
     try:
         # Buscar apenas membros que têm o cargo da guilda
         if not interaction.guild:
@@ -579,11 +661,13 @@ async def ranking_gearscore(interaction: discord.Interaction):
             )
             return
         
+        await interaction.response.defer(ephemeral=True)
+        
         valid_user_ids = await get_guild_member_ids(interaction.guild)
         results = db.get_all_gearscores(valid_user_ids=valid_user_ids)
         
         if not results:
-            await interaction.response.send_message(
+            await interaction.followup.send(
                 "❌ Nenhum gearscore cadastrado ainda!",
                 ephemeral=True
             )
@@ -635,13 +719,167 @@ async def ranking_gearscore(interaction: discord.Interaction):
             medal = "🥇" if i == 1 else "🥈" if i == 2 else "🥉" if i == 3 else f"#{i}"
             embed.add_field(name=f"{medal} {family_name}", value=info, inline=False)
         
-        await interaction.response.send_message(embed=embed)
+        await interaction.followup.send(embed=embed, ephemeral=True)
         
     except Exception as e:
+        if interaction.response.is_done():
+            await interaction.followup.send(
+                f"❌ Erro ao buscar ranking: {str(e)}",
+                ephemeral=True
+            )
+        else:
+            await interaction.response.send_message(
+                f"❌ Erro ao buscar ranking: {str(e)}",
+                ephemeral=True
+            )
+
+@bot.tree.command(name="membros_classe", description="[ADMIN] Visualiza todos os membros registrados de uma classe")
+@app_commands.describe(
+    classe="Classe a ser visualizada (digite para buscar)"
+)
+@app_commands.autocomplete(classe=classe_autocomplete)
+@app_commands.default_permissions(administrator=True)
+async def membros_classe(interaction: discord.Interaction, classe: str):
+    """Visualiza todos os membros registrados de uma classe com todas as informações (apenas administradores)"""
+    if not interaction.user.guild_permissions.administrator:
         await interaction.response.send_message(
-            f"❌ Erro ao buscar ranking: {str(e)}",
+            "❌ Apenas administradores podem usar este comando!",
             ephemeral=True
         )
+        return
+    
+    # Validar classe
+    if classe not in BDO_CLASSES:
+        await interaction.response.send_message(
+            f"❌ Classe inválida! Use o autocomplete para selecionar uma classe válida.",
+            ephemeral=True
+        )
+        return
+    
+    try:
+        # Verificar se é em um servidor
+        if not interaction.guild:
+            await interaction.response.send_message(
+                "❌ Este comando só pode ser usado em um servidor!",
+                ephemeral=True
+            )
+            return
+        
+        await interaction.response.defer(ephemeral=True)
+        
+        # Buscar apenas membros que têm o cargo da guilda
+        valid_user_ids = await get_guild_member_ids(interaction.guild)
+        members = db.get_class_members(classe, valid_user_ids=valid_user_ids)
+        
+        if not members:
+            await interaction.followup.send(
+                f"❌ Nenhum membro encontrado com a classe **{classe}** (apenas membros com cargo da guilda)",
+                ephemeral=True
+            )
+            return
+        
+        # Ordenar por GS (maior para menor)
+        def get_gs_from_member(member):
+            if isinstance(member, dict):
+                ap = member.get('ap', 0)
+                aap = member.get('aap', 0)
+                dp = member.get('dp', 0)
+            else:
+                ap = member[4] if len(member) > 4 else 0
+                aap = member[5] if len(member) > 5 else 0
+                dp = member[6] if len(member) > 6 else 0
+            return calculate_gs(ap, aap, dp)
+        
+        sorted_members = sorted(members, key=get_gs_from_member, reverse=True)
+        
+        # Criar embed principal
+        embed = discord.Embed(
+            title=f"🎭 {classe} - Membros Registrados",
+            description=f"Total: **{len(sorted_members)}** membro(s) registrado(s)",
+            color=discord.Color.blue(),
+            timestamp=discord.utils.utcnow()
+        )
+        
+        # Adicionar informações de cada membro
+        for i, member in enumerate(sorted_members, 1):
+            # Formatar dados dependendo do banco
+            if isinstance(member, dict):
+                family_name = member.get('family_name', 'N/A')
+                ap = member.get('ap', 0)
+                aap = member.get('aap', 0)
+                dp = member.get('dp', 0)
+                linkgear = member.get('linkgear', 'N/A')
+                updated_at = member.get('updated_at', 'N/A')
+            else:
+                # SQLite/PostgreSQL: id, user_id, family_name, class_pvp, ap, aap, dp, linkgear, updated_at
+                family_name = member[2] if len(member) > 2 else 'N/A'
+                ap = member[4] if len(member) > 4 else 0
+                aap = member[5] if len(member) > 5 else 0
+                dp = member[6] if len(member) > 6 else 0
+                linkgear = member[7] if len(member) > 7 else 'N/A'
+                updated_at = member[8] if len(member) > 8 else 'N/A'
+            
+            gs_total = calculate_gs(ap, aap, dp)
+            
+            # Formatar data de atualização
+            if updated_at and updated_at != 'N/A':
+                if hasattr(updated_at, 'strftime'):
+                    try:
+                        date_str = updated_at.strftime("%d/%m/%Y às %H:%M")
+                    except:
+                        date_str = str(updated_at)
+                elif isinstance(updated_at, str):
+                    try:
+                        from datetime import datetime
+                        if 'T' in updated_at:
+                            date_clean = updated_at.replace('Z', '+00:00').split('+')[0].split('.')[0]
+                            dt = datetime.fromisoformat(date_clean)
+                            date_str = dt.strftime("%d/%m/%Y às %H:%M")
+                        else:
+                            date_str = updated_at
+                    except:
+                        date_str = updated_at
+                else:
+                    date_str = str(updated_at)
+            else:
+                date_str = 'N/A'
+            
+            # Criar texto do membro
+            member_info = f"**GS Total:** {gs_total}\n"
+            member_info += f"⚔️ AP: {ap} | 🔥 AAP: {aap} | 🛡️ DP: {dp}\n"
+            member_info += f"🔗 **Link Gear:** {linkgear}\n"
+            member_info += f"📅 **Última atualização:** {date_str}"
+            
+            # Adicionar campo (limite de 25 campos por embed do Discord)
+            if i <= 25:
+                embed.add_field(
+                    name=f"#{i} - {family_name}",
+                    value=member_info,
+                    inline=False
+                )
+        
+        if len(sorted_members) > 25:
+            embed.set_footer(text=f"Mostrando 25 de {len(sorted_members)} membros")
+        else:
+            embed.set_footer(text=f"Total de {len(sorted_members)} membros")
+        
+        await interaction.followup.send(embed=embed, ephemeral=True)
+        
+    except Exception as e:
+        import traceback
+        error_details = traceback.format_exc()
+        print(f"Erro ao buscar membros da classe: {error_details}")
+        
+        if interaction.response.is_done():
+            await interaction.followup.send(
+                f"❌ Erro ao buscar membros da classe: {str(e)}",
+                ephemeral=True
+            )
+        else:
+            await interaction.response.send_message(
+                f"❌ Erro ao buscar membros da classe: {str(e)}",
+                ephemeral=True
+            )
 
 @bot.tree.command(name="enviar_dm", description="Envia uma mensagem direta (DM) para um usuário")
 @app_commands.describe(
@@ -746,12 +984,354 @@ async def gearscore_dm(interaction: discord.Interaction):
             ephemeral=True
         )
 
+# Autocomplete para canais de voz
+async def voice_channel_autocomplete(
+    interaction: discord.Interaction,
+    current: str,
+) -> list[app_commands.Choice[str]]:
+    """Autocomplete para canais de voz do servidor"""
+    if not interaction.guild:
+        return []
+    
+    # Buscar todos os canais de voz
+    voice_channels = [
+        channel for channel in interaction.guild.channels 
+        if isinstance(channel, discord.VoiceChannel)
+    ]
+    
+    # Filtrar por nome se houver texto digitado
+    if current:
+        filtered = [
+            channel for channel in voice_channels
+            if current.lower() in channel.name.lower()
+        ][:25]
+    else:
+        filtered = voice_channels[:25]
+    
+    return [
+        app_commands.Choice(name=channel.name, value=str(channel.id))
+        for channel in filtered
+    ]
+
+@bot.tree.command(name="lista", description="Cria uma lista dos membros em um canal de voz")
+@app_commands.describe(
+    sala="Canal de voz para listar os membros (digite para buscar)",
+    nome_lista="Nome da lista"
+)
+@app_commands.autocomplete(sala=voice_channel_autocomplete)
+async def lista(interaction: discord.Interaction, sala: str, nome_lista: str):
+    """Cria uma lista dos membros conectados em um canal de voz e envia para o canal de listas"""
+    try:
+        if not interaction.guild:
+            await interaction.response.send_message(
+                "❌ Este comando só pode ser usado em um servidor!",
+                ephemeral=True
+            )
+            return
+        
+        await interaction.response.defer(ephemeral=True)
+        
+        # Buscar o canal de voz
+        voice_channel = interaction.guild.get_channel(int(sala))
+        if not voice_channel or not isinstance(voice_channel, discord.VoiceChannel):
+            await interaction.followup.send(
+                "❌ Canal de voz não encontrado!",
+                ephemeral=True
+            )
+            return
+        
+        # Buscar membros conectados no canal de voz
+        members_in_voice = [
+            member for member in voice_channel.members
+            if not member.bot  # Excluir bots
+        ]
+        
+        if not members_in_voice:
+            await interaction.followup.send(
+                f"❌ Nenhum membro encontrado no canal de voz **{voice_channel.name}**!",
+                ephemeral=True
+            )
+            return
+        
+        # Buscar o canal de destino
+        list_channel = bot.get_channel(LIST_CHANNEL_ID)
+        if not list_channel:
+            list_channel = await bot.fetch_channel(LIST_CHANNEL_ID)
+        
+        if not list_channel:
+            await interaction.followup.send(
+                "❌ Canal de listas não encontrado!",
+                ephemeral=True
+            )
+            return
+        
+        # Criar embed com a lista
+        embed = discord.Embed(
+            title=f"📋 {nome_lista}",
+            description=f"Lista de membros do canal de voz: **{voice_channel.mention}**",
+            color=discord.Color.blue(),
+            timestamp=discord.utils.utcnow()
+        )
+        
+        # Adicionar informações
+        embed.add_field(
+            name="🎤 Canal de Voz",
+            value=voice_channel.mention,
+            inline=True
+        )
+        
+        embed.add_field(
+            name="👥 Total de Membros",
+            value=f"**{len(members_in_voice)}** membro(s)",
+            inline=True
+        )
+        
+        # Formatar data e horário (fuso horário de Brasília)
+        brasilia_tz = timezone('America/Sao_Paulo')
+        now = datetime.now(brasilia_tz)
+        date_str = now.strftime("%d/%m/%Y")
+        time_str = now.strftime("%H:%M:%S")
+        
+        embed.add_field(
+            name="📅 Data e Horário",
+            value=f"**{date_str}** às **{time_str}**",
+            inline=True
+        )
+        
+        # Criar lista de membros
+        members_list = ""
+        for i, member in enumerate(members_in_voice, 1):
+            members_list += f"{i}. {member.mention} ({member.display_name})\n"
+        
+        # Dividir em múltiplos campos se necessário (limite de 1024 caracteres por field)
+        if len(members_list) > 1000:
+            # Dividir a lista
+            chunks = []
+            current_chunk = ""
+            for i, member in enumerate(members_in_voice, 1):
+                line = f"{i}. {member.mention} ({member.display_name})\n"
+                if len(current_chunk + line) > 1000:
+                    chunks.append(current_chunk)
+                    current_chunk = line
+                else:
+                    current_chunk += line
+            
+            if current_chunk:
+                chunks.append(current_chunk)
+            
+            # Adicionar campos
+            for i, chunk in enumerate(chunks, 1):
+                field_name = "👥 Membros" if i == 1 else f"👥 Membros (cont.)"
+                embed.add_field(
+                    name=field_name,
+                    value=chunk,
+                    inline=False
+                )
+        else:
+            embed.add_field(
+                name="👥 Membros",
+                value=members_list,
+                inline=False
+            )
+        
+        embed.set_footer(text=f"Lista criada por {interaction.user.display_name}")
+        
+        # Enviar para o canal de listas
+        await list_channel.send(embed=embed)
+        
+        await interaction.followup.send(
+            f"✅ Lista **{nome_lista}** criada com sucesso e enviada para o canal de listas!",
+            ephemeral=True
+        )
+        
+    except ValueError:
+        await interaction.followup.send(
+            "❌ ID do canal de voz inválido!",
+            ephemeral=True
+        )
+    except Exception as e:
+        import traceback
+        error_details = traceback.format_exc()
+        print(f"Erro ao criar lista: {error_details}")
+        
+        if interaction.response.is_done():
+            await interaction.followup.send(
+                f"❌ Erro ao criar lista: {str(e)}",
+                ephemeral=True
+            )
+        else:
+            await interaction.response.send_message(
+                f"❌ Erro ao criar lista: {str(e)}",
+                ephemeral=True
+            )
+
+@bot.tree.command(name="mover_sala", description="[ADMIN] Move todos os membros de uma sala de voz para outra")
+@app_commands.describe(
+    sala_origem="Canal de voz de origem (digite para buscar)",
+    sala_destino="Canal de voz de destino (digite para buscar)"
+)
+@app_commands.autocomplete(sala_origem=voice_channel_autocomplete)
+@app_commands.autocomplete(sala_destino=voice_channel_autocomplete)
+@app_commands.default_permissions(administrator=True)
+async def mover_sala(interaction: discord.Interaction, sala_origem: str, sala_destino: str):
+    """Move todos os membros de uma sala de voz para outra (apenas administradores)"""
+    if not interaction.user.guild_permissions.administrator:
+        await interaction.response.send_message(
+            "❌ Apenas administradores podem usar este comando!",
+            ephemeral=True
+        )
+        return
+    
+    try:
+        if not interaction.guild:
+            await interaction.response.send_message(
+                "❌ Este comando só pode ser usado em um servidor!",
+                ephemeral=True
+            )
+            return
+        
+        await interaction.response.defer(ephemeral=True)
+        
+        # Buscar os canais de voz
+        origin_channel = interaction.guild.get_channel(int(sala_origem))
+        destination_channel = interaction.guild.get_channel(int(sala_destino))
+        
+        if not origin_channel or not isinstance(origin_channel, discord.VoiceChannel):
+            await interaction.followup.send(
+                "❌ Canal de voz de origem não encontrado!",
+                ephemeral=True
+            )
+            return
+        
+        if not destination_channel or not isinstance(destination_channel, discord.VoiceChannel):
+            await interaction.followup.send(
+                "❌ Canal de voz de destino não encontrado!",
+                ephemeral=True
+            )
+            return
+        
+        if origin_channel.id == destination_channel.id:
+            await interaction.followup.send(
+                "❌ Os canais de origem e destino não podem ser o mesmo!",
+                ephemeral=True
+            )
+            return
+        
+        # Buscar membros no canal de origem
+        members_to_move = [
+            member for member in origin_channel.members
+            if not member.bot  # Excluir bots
+        ]
+        
+        if not members_to_move:
+            await interaction.followup.send(
+                f"❌ Nenhum membro encontrado no canal de voz **{origin_channel.name}**!",
+                ephemeral=True
+            )
+            return
+        
+        # Mover membros
+        moved_count = 0
+        failed_members = []
+        
+        for member in members_to_move:
+            try:
+                await member.move_to(destination_channel, reason=f"Movido por {interaction.user.display_name}")
+                moved_count += 1
+            except discord.Forbidden:
+                failed_members.append((member, "Sem permissão para mover"))
+            except discord.HTTPException as e:
+                failed_members.append((member, str(e)))
+            except Exception as e:
+                failed_members.append((member, str(e)))
+                print(f"Erro ao mover {member.display_name}: {str(e)}")
+        
+        # Criar embed com resultado
+        embed = discord.Embed(
+            title="🔄 Movimentação de Membros",
+            description=f"Resultado da movimentação de membros entre salas de voz",
+            color=discord.Color.blue(),
+            timestamp=discord.utils.utcnow()
+        )
+        
+        embed.add_field(
+            name="📤 Canal de Origem",
+            value=origin_channel.mention,
+            inline=True
+        )
+        
+        embed.add_field(
+            name="📥 Canal de Destino",
+            value=destination_channel.mention,
+            inline=True
+        )
+        
+        embed.add_field(
+            name="✅ Movidos com Sucesso",
+            value=f"**{moved_count}** membro(s)",
+            inline=True
+        )
+        
+        if failed_members:
+            embed.add_field(
+                name="❌ Falhas",
+                value=f"**{len(failed_members)}** membro(s) não puderam ser movidos",
+                inline=True
+            )
+            
+            # Lista de falhas (limitada)
+            failed_list = ""
+            for member, reason in failed_members[:10]:  # Limitar a 10 para não exceder
+                failed_list += f"• {member.mention} - {reason}\n"
+            
+            if len(failed_members) > 10:
+                failed_list += f"\n... e mais {len(failed_members) - 10} membro(s)"
+            
+            if failed_list:
+                embed.add_field(
+                    name="🚫 Membros que Falharam",
+                    value=failed_list,
+                    inline=False
+                )
+        
+        embed.set_footer(text=f"Movimentação executada por {interaction.user.display_name}")
+        
+        await interaction.followup.send(embed=embed, ephemeral=True)
+        
+        # Enviar log de movimentação para o canal de logs
+        await send_move_log_to_channel(
+            bot, interaction, origin_channel, destination_channel,
+            moved_count, len(failed_members), failed_members
+        )
+        
+    except ValueError:
+        await interaction.followup.send(
+            "❌ ID do canal de voz inválido!",
+            ephemeral=True
+        )
+    except Exception as e:
+        import traceback
+        error_details = traceback.format_exc()
+        print(f"Erro ao mover membros: {error_details}")
+        
+        if interaction.response.is_done():
+            await interaction.followup.send(
+                f"❌ Erro ao mover membros: {str(e)}",
+                ephemeral=True
+            )
+        else:
+            await interaction.response.send_message(
+                f"❌ Erro ao mover membros: {str(e)}",
+                ephemeral=True
+            )
+
 @bot.tree.command(name="dm_cargo", description="Envia DM em massa para todos os membros com cargo(s) específico(s)")
 @app_commands.describe(
     cargos="Mencione os cargos (ex: @Cargo1 @Cargo2) ou IDs separados por vírgula",
-    mensagem="Mensagem a ser enviada"
+    mensagem="Mensagem a ser enviada",
+    imagem="Imagem a ser enviada junto com a mensagem (opcional)"
 )
-async def dm_cargo(interaction: discord.Interaction, cargos: str, mensagem: str):
+async def dm_cargo(interaction: discord.Interaction, cargos: str, mensagem: str, imagem: discord.Attachment = None):
     """Envia DM para todos os membros com um ou mais cargos específicos"""
     # Verificar permissão
     if not has_dm_permission(interaction.user):
@@ -815,28 +1395,73 @@ async def dm_cargo(interaction: discord.Interaction, cargos: str, mensagem: str)
             )
             return
         
+        # Validar se a imagem é uma imagem válida
+        image_url = None
+        image_bytes = None
+        image_filename = None
+        
+        if imagem:
+            # Verificar se é uma imagem
+            if not imagem.content_type or not imagem.content_type.startswith('image/'):
+                await interaction.followup.send(
+                    "❌ O arquivo anexado não é uma imagem válida!",
+                    ephemeral=True
+                )
+                return
+            
+            # Baixar a imagem
+            try:
+                image_bytes = await imagem.read()
+                image_filename = imagem.filename or "image.png"
+                # Usar URL para embed
+                image_url = imagem.url
+            except Exception as e:
+                await interaction.followup.send(
+                    f"❌ Erro ao processar a imagem: {str(e)}",
+                    ephemeral=True
+                )
+                return
+        
         embed = discord.Embed(
             title="📨 Mensagem do Bot",
             description=mensagem,
             color=discord.Color.blue(),
             timestamp=discord.utils.utcnow()
         )
-        embed.set_footer(text=f"Enviado por {interaction.user.display_name}")
+        
+        # Adicionar imagem ao embed se houver
+        if image_url:
+            embed.set_image(url=image_url)
+        
+        # Footer nas DMs sempre mostra "Staff MOUZ"
+        embed.set_footer(text="Staff MOUZ")
         
         sent = 0
         failed = 0
         blocked_members = []  # Lista de quem não recebeu
+        success_members = []  # Lista de quem recebeu com sucesso
         
         for member in members_with_roles:
             try:
-                await member.send(embed=embed)
+                # Enviar com imagem se houver
+                if image_bytes:
+                    # Criar nova instância do arquivo para cada envio
+                    image_file = discord.File(
+                        io.BytesIO(image_bytes),
+                        filename=image_filename
+                    )
+                    await member.send(embed=embed, file=image_file)
+                else:
+                    await member.send(embed=embed)
                 sent += 1
+                success_members.append(member)
             except discord.Forbidden:
                 failed += 1
                 blocked_members.append(member)
-            except Exception:
+            except Exception as e:
                 failed += 1
                 blocked_members.append(member)
+                print(f"Erro ao enviar DM para {member.display_name}: {str(e)}")
         
         # Criar relatório detalhado
         role_mentions = ', '.join([role.mention for role in roles])
@@ -889,6 +1514,182 @@ async def dm_cargo(interaction: discord.Interaction, cargos: str, mensagem: str)
         report_embed.set_footer(text=f"Envio executado por {interaction.user.display_name}")
         
         await interaction.followup.send(embed=report_embed, ephemeral=True)
+        
+        # Enviar lista pública no canal de relatórios (em formato embed)
+        try:
+            report_channel = bot.get_channel(DM_REPORT_CHANNEL_ID)
+            if not report_channel:
+                report_channel = await bot.fetch_channel(DM_REPORT_CHANNEL_ID)
+            
+            if report_channel:
+                role_mentions = ', '.join([role.mention for role in roles])
+                
+                # Criar embed principal
+                main_embed = discord.Embed(
+                    title="📨 Relatório de Envio de DMs",
+                    description=f"Resultado do envio de mensagens para membros com os cargos: {role_mentions}",
+                    color=discord.Color.blue(),
+                    timestamp=discord.utils.utcnow()
+                )
+                
+                # Adicionar estatísticas gerais
+                main_embed.add_field(
+                    name="📊 Estatísticas",
+                    value=f"**Total de membros:** {len(members_with_roles)}\n"
+                          f"**✅ Receberam:** {sent}\n"
+                          f"**❌ Não receberam:** {failed}",
+                    inline=False
+                )
+                
+                main_embed.set_footer(text=f"Enviado por {interaction.user.display_name}")
+                
+                # Enviar embed principal
+                await report_channel.send(embed=main_embed)
+                
+                # Criar embed com lista de quem recebeu
+                if success_members:
+                    success_embed = discord.Embed(
+                        title="✅ Membros que Receberam a DM",
+                        color=discord.Color.green(),
+                        timestamp=discord.utils.utcnow()
+                    )
+                    
+                    # Dividir lista em chunks para não exceder limite de 1024 caracteres por field
+                    members_list = ""
+                    field_count = 0
+                    
+                    for i, member in enumerate(success_members, 1):
+                        line = f"{i}. {member.display_name} ✅\n"
+                        
+                        # Se adicionar esta linha exceder o limite, criar novo field
+                        if len(members_list + line) > 1000:  # Margem de segurança
+                            field_count += 1
+                            field_name = "✅ Receberam" if field_count == 1 else f"✅ Receberam (cont.)"
+                            success_embed.add_field(
+                                name=field_name,
+                                value=members_list,
+                                inline=False
+                            )
+                            members_list = line
+                        else:
+                            members_list += line
+                    
+                    # Adicionar último field se houver conteúdo
+                    if members_list:
+                        field_count += 1
+                        field_name = "✅ Receberam" if field_count == 1 else f"✅ Receberam (cont.)"
+                        success_embed.add_field(
+                            name=field_name,
+                            value=members_list,
+                            inline=False
+                        )
+                    
+                    # Se exceder 25 fields (limite do Discord), dividir em múltiplos embeds
+                    if len(success_embed.fields) > 25:
+                        # Enviar primeiro embed com até 25 fields
+                        first_embed = discord.Embed(
+                            title="✅ Membros que Receberam a DM (Parte 1)",
+                            color=discord.Color.green(),
+                            timestamp=discord.utils.utcnow()
+                        )
+                        for field in success_embed.fields[:25]:
+                            first_embed.add_field(
+                                name=field.name,
+                                value=field.value,
+                                inline=False
+                            )
+                        await report_channel.send(embed=first_embed)
+                        
+                        # Enviar segundo embed com o restante
+                        if len(success_embed.fields) > 25:
+                            second_embed = discord.Embed(
+                                title="✅ Membros que Receberam a DM (Parte 2)",
+                                color=discord.Color.green(),
+                                timestamp=discord.utils.utcnow()
+                            )
+                            for field in success_embed.fields[25:]:
+                                second_embed.add_field(
+                                    name=field.name,
+                                    value=field.value,
+                                    inline=False
+                                )
+                            await report_channel.send(embed=second_embed)
+                    else:
+                        await report_channel.send(embed=success_embed)
+                
+                # Criar embed com lista de quem falhou
+                if blocked_members:
+                    failed_embed = discord.Embed(
+                        title="❌ Membros que Não Receberam a DM",
+                        description="Bot bloqueado ou DMs desabilitadas",
+                        color=discord.Color.red(),
+                        timestamp=discord.utils.utcnow()
+                    )
+                    
+                    # Dividir lista em chunks
+                    members_list = ""
+                    field_count = 0
+                    
+                    for i, member in enumerate(blocked_members, 1):
+                        line = f"{i}. {member.display_name} ❌\n"
+                        
+                        if len(members_list + line) > 1000:
+                            field_count += 1
+                            field_name = "❌ Não receberam" if field_count == 1 else f"❌ Não receberam (cont.)"
+                            failed_embed.add_field(
+                                name=field_name,
+                                value=members_list,
+                                inline=False
+                            )
+                            members_list = line
+                        else:
+                            members_list += line
+                    
+                    # Adicionar último field
+                    if members_list:
+                        field_count += 1
+                        field_name = "❌ Não receberam" if field_count == 1 else f"❌ Não receberam (cont.)"
+                        failed_embed.add_field(
+                            name=field_name,
+                            value=members_list,
+                            inline=False
+                        )
+                    
+                    # Dividir em múltiplos embeds se necessário
+                    if len(failed_embed.fields) > 25:
+                        first_embed = discord.Embed(
+                            title="❌ Membros que Não Receberam a DM (Parte 1)",
+                            description="Bot bloqueado ou DMs desabilitadas",
+                            color=discord.Color.red(),
+                            timestamp=discord.utils.utcnow()
+                        )
+                        for field in failed_embed.fields[:25]:
+                            first_embed.add_field(
+                                name=field.name,
+                                value=field.value,
+                                inline=False
+                            )
+                        await report_channel.send(embed=first_embed)
+                        
+                        if len(failed_embed.fields) > 25:
+                            second_embed = discord.Embed(
+                                title="❌ Membros que Não Receberam a DM (Parte 2)",
+                                description="Bot bloqueado ou DMs desabilitadas",
+                                color=discord.Color.red(),
+                                timestamp=discord.utils.utcnow()
+                            )
+                            for field in failed_embed.fields[25:]:
+                                second_embed.add_field(
+                                    name=field.name,
+                                    value=field.value,
+                                    inline=False
+                                )
+                            await report_channel.send(embed=second_embed)
+                    else:
+                        await report_channel.send(embed=failed_embed)
+                        
+        except Exception as e:
+            print(f"Erro ao enviar relatório no canal: {str(e)}")
     except Exception as e:
         await interaction.followup.send(
             f"❌ Erro ao enviar DMs: {str(e)}",
@@ -918,7 +1719,7 @@ async def admin_lista_classe(interaction: discord.Interaction, classe: str):
     
     if classe not in BDO_CLASSES:
         await interaction.response.send_message(
-            f"❌ Classe inválida! Use `/classes_bdo` para ver as classes disponíveis.",
+            f"❌ Classe inválida! Use `/estatisticas_classes` para ver as classes disponíveis.",
             ephemeral=True
         )
         return
@@ -1292,7 +2093,7 @@ async def admin_gs_medio_classe(interaction: discord.Interaction, classe: str):
     
     if classe not in BDO_CLASSES:
         await interaction.response.send_message(
-            f"❌ Classe inválida! Use `/classes_bdo` para ver as classes disponíveis.",
+            f"❌ Classe inválida! Use `/estatisticas_classes` para ver as classes disponíveis.",
             ephemeral=True
         )
         return
@@ -1389,6 +2190,122 @@ async def admin_gs_medio_classe(interaction: discord.Interaction, classe: str):
         else:
             await interaction.response.send_message(
                 f"❌ Erro ao analisar classe: {str(e)}",
+                ephemeral=True
+            )
+
+@bot.tree.command(name="admin_membros_sem_registro", description="[ADMIN] Lista membros com cargo da guilda que ainda não registraram gearscore")
+@app_commands.default_permissions(administrator=True)
+async def admin_membros_sem_registro(interaction: discord.Interaction):
+    """Lista membros com cargo da guilda que ainda não fizeram registro (apenas administradores)"""
+    if not interaction.user.guild_permissions.administrator:
+        await interaction.response.send_message(
+            "❌ Apenas administradores podem usar este comando!",
+            ephemeral=True
+        )
+        return
+    
+    try:
+        await interaction.response.defer(ephemeral=True)
+        
+        # Buscar todos os membros com o cargo da guilda
+        valid_user_ids = await get_guild_member_ids(interaction.guild)
+        
+        if not valid_user_ids:
+            await interaction.followup.send(
+                "❌ Nenhum membro com o cargo da guilda encontrado!",
+                ephemeral=True
+            )
+            return
+        
+        # Buscar todos os registros do banco de dados
+        all_registered = db.get_all_gearscores(valid_user_ids=valid_user_ids)
+        
+        # Extrair user_ids que têm registro
+        registered_user_ids = set()
+        for record in all_registered:
+            if isinstance(record, dict):
+                user_id = record.get('user_id', '')
+            else:
+                # SQLite/PostgreSQL: id, user_id, family_name, class_pvp, ap, aap, dp, linkgear, updated_at
+                user_id = record[1] if len(record) > 1 else ''
+            
+            if user_id:
+                registered_user_ids.add(str(user_id))
+        
+        # Encontrar membros sem registro
+        members_without_registry = []
+        for user_id in valid_user_ids:
+            if user_id not in registered_user_ids:
+                member = interaction.guild.get_member(int(user_id))
+                if member:
+                    members_without_registry.append(member)
+        
+        # Criar embed
+        embed = discord.Embed(
+            title="📋 Membros Sem Registro",
+            description=f"Membros com cargo da guilda que ainda não registraram gearscore",
+            color=discord.Color.orange(),
+            timestamp=discord.utils.utcnow()
+        )
+        
+        if not members_without_registry:
+            embed.add_field(
+                name="✅ Todos Registrados",
+                value="Todos os membros com cargo da guilda já possuem registro!",
+                inline=False
+            )
+        else:
+            # Ordenar por nome
+            members_without_registry.sort(key=lambda m: m.display_name.lower())
+            
+            # Criar lista de membros
+            members_list = ""
+            for i, member in enumerate(members_without_registry, 1):
+                members_list += f"{i}. {member.mention} ({member.display_name})\n"
+                
+                # Dividir em múltiplos campos se necessário (limite de 1024 caracteres por field)
+                if len(members_list) > 900:  # Deixar margem
+                    # Adicionar campo atual
+                    embed.add_field(
+                        name=f"🚫 Membros Sem Registro (cont.)",
+                        value=members_list,
+                        inline=False
+                    )
+                    members_list = ""
+            
+            # Adicionar último campo se houver conteúdo
+            if members_list:
+                field_name = "🚫 Membros Sem Registro" if len(embed.fields) == 0 else "🚫 Membros Sem Registro (cont.)"
+                embed.add_field(
+                    name=field_name,
+                    value=members_list,
+                    inline=False
+                )
+            
+            embed.add_field(
+                name="📊 Estatísticas",
+                value=f"**Total sem registro:** {len(members_without_registry)} membro(s)\n"
+                      f"**Total com registro:** {len(registered_user_ids)} membro(s)\n"
+                      f"**Total de membros:** {len(valid_user_ids)} membro(s)",
+                inline=False
+            )
+        
+        embed.set_footer(text=f"Consulta executada por {interaction.user.display_name}")
+        await interaction.followup.send(embed=embed, ephemeral=True)
+        
+    except Exception as e:
+        import traceback
+        error_details = traceback.format_exc()
+        print(f"Erro ao buscar membros sem registro: {error_details}")
+        
+        if interaction.response.is_done():
+            await interaction.followup.send(
+                f"❌ Erro ao buscar membros sem registro: {str(e)}",
+                ephemeral=True
+            )
+        else:
+            await interaction.response.send_message(
+                f"❌ Erro ao buscar membros sem registro: {str(e)}",
                 ephemeral=True
             )
 

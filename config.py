@@ -27,6 +27,15 @@ ALLOWED_DM_ROLES = [role_id.strip() for role_id in ALLOWED_DM_ROLES if role_id.s
 # ID do canal para notificações de registro/atualização
 NOTIFICATION_CHANNEL_ID = 1442347196103004242
 
+# ID do canal para relatórios de DM em massa
+DM_REPORT_CHANNEL_ID = 1442359729044066405
+
+# ID do canal para listas de membros em salas de voz
+LIST_CHANNEL_ID = 1412698827026075779
+
+# ID do canal para logs de movimentação de membros entre salas
+MOVE_LOG_CHANNEL_ID = 1442371565022089237
+
 # ID do cargo que indica que o player faz parte da guilda (MOUZ/MANIFEST)
 GUILD_MEMBER_ROLE_ID = 1412255708967207012
 
