@@ -20,84 +20,153 @@ class Database:
         conn = self.get_connection()
         cursor = conn.cursor()
         
-        # Verificar e migrar tabela gearscore se necessário
-        cursor.execute('''
-            SELECT column_name 
-            FROM information_schema.columns 
-            WHERE table_name = 'gearscore' AND column_name = 'character_name'
-        ''')
-        has_character_name = cursor.fetchone()
-        
-        if has_character_name:
-            # Migrar tabela gearscore: remover character_name, adicionar constraint nova
+        try:
+            # Verificar se a tabela gearscore existe
+            cursor.execute('''
+                SELECT EXISTS (
+                    SELECT FROM information_schema.tables 
+                    WHERE table_name = 'gearscore'
+                )
+            ''')
+            result = cursor.fetchone()
+            table_exists = result[0] if result else False
+            
+            # Verificar e migrar tabela gearscore se necessário
+            has_character_name = None
+            if table_exists:
+                try:
+                    cursor.execute('''
+                        SELECT column_name 
+                        FROM information_schema.columns 
+                        WHERE table_name = 'gearscore' AND column_name = 'character_name'
+                    ''')
+                    has_character_name = cursor.fetchone()
+                except Exception:
+                    # Erro ao verificar coluna, fazer rollback
+                    has_character_name = None
+                    conn.rollback()
+            
+            if has_character_name:
+                # Migrar tabela gearscore: remover character_name, adicionar constraint nova
+                try:
+                    # Dropar constraint antiga se existir
+                    cursor.execute('''
+                        ALTER TABLE gearscore 
+                        DROP CONSTRAINT IF EXISTS gearscore_user_id_character_name_key
+                    ''')
+                    
+                    # Adicionar coluna class_pvp se não existir (pode ter sido criada parcialmente)
+                    cursor.execute('''
+                        SELECT column_name 
+                        FROM information_schema.columns 
+                        WHERE table_name = 'gearscore' AND column_name = 'class_pvp'
+                    ''')
+                    if not cursor.fetchone():
+                        cursor.execute('''
+                            ALTER TABLE gearscore 
+                            ADD COLUMN class_pvp TEXT
+                        ''')
+                        # Atualizar class_pvp com valor padrão se necessário
+                        cursor.execute('''
+                            UPDATE gearscore 
+                            SET class_pvp = 'Unknown' 
+                            WHERE class_pvp IS NULL
+                        ''')
+                        cursor.execute('''
+                            ALTER TABLE gearscore 
+                            ALTER COLUMN class_pvp SET NOT NULL
+                        ''')
+                    
+                    # Remover coluna character_name
+                    cursor.execute('''
+                        ALTER TABLE gearscore 
+                        DROP COLUMN IF EXISTS character_name
+                    ''')
+                    
+                    # Adicionar constraint nova (se não existir)
+                    try:
+                        # Verificar se a constraint já existe
+                        cursor.execute('''
+                            SELECT constraint_name 
+                            FROM information_schema.table_constraints 
+                            WHERE table_name = 'gearscore' 
+                            AND constraint_name = 'gearscore_user_id_class_pvp_key'
+                        ''')
+                        constraint_exists = cursor.fetchone()
+                        
+                        if not constraint_exists:
+                            cursor.execute('''
+                                ALTER TABLE gearscore 
+                                ADD CONSTRAINT gearscore_user_id_class_pvp_key 
+                                UNIQUE (user_id, class_pvp)
+                            ''')
+                    except Exception as e:
+                        # Constraint já existe ou erro, fazer rollback e continuar
+                        print(f"Aviso ao adicionar constraint: {e}")
+                        conn.rollback()
+                except Exception as e:
+                    print(f"Aviso na migração de gearscore: {e}")
+                    conn.rollback()
+            
+            # Adicionar coluna character_name se não existir
             try:
-                # Dropar constraint antiga se existir
-                cursor.execute('''
-                    ALTER TABLE gearscore 
-                    DROP CONSTRAINT IF EXISTS gearscore_user_id_character_name_key
-                ''')
-                
-                # Adicionar coluna class_pvp se não existir (pode ter sido criada parcialmente)
                 cursor.execute('''
                     SELECT column_name 
                     FROM information_schema.columns 
-                    WHERE table_name = 'gearscore' AND column_name = 'class_pvp'
+                    WHERE table_name = 'gearscore' AND column_name = 'character_name'
                 ''')
-                if not cursor.fetchone():
+                has_character_name = cursor.fetchone()
+            except Exception:
+                # Tabela pode não existir ainda
+                has_character_name = None
+                conn.rollback()
+            
+            if not has_character_name:
+                try:
                     cursor.execute('''
                         ALTER TABLE gearscore 
-                        ADD COLUMN class_pvp TEXT
+                        ADD COLUMN character_name TEXT
                     ''')
-                    # Atualizar class_pvp com valor padrão se necessário
-                    cursor.execute('''
-                        UPDATE gearscore 
-                        SET class_pvp = 'Unknown' 
-                        WHERE class_pvp IS NULL
-                    ''')
-                    cursor.execute('''
-                        ALTER TABLE gearscore 
-                        ALTER COLUMN class_pvp SET NOT NULL
-                    ''')
-                
-                # Remover coluna character_name
-                cursor.execute('''
-                    ALTER TABLE gearscore 
-                    DROP COLUMN IF EXISTS character_name
-                ''')
-                
-                # Adicionar constraint nova
-                cursor.execute('''
-                    ALTER TABLE gearscore 
-                    ADD CONSTRAINT gearscore_user_id_class_pvp_key 
-                    UNIQUE (user_id, class_pvp)
-                ''')
-            except Exception as e:
-                print(f"Aviso na migração de gearscore: {e}")
+                except Exception as e:
+                    print(f"Aviso ao adicionar character_name: {e}")
+                    conn.rollback()
+        except Exception as e:
+            print(f"Erro na inicialização: {e}")
+            conn.rollback()
         
         # Criar tabela gearscore com estrutura nova
-        cursor.execute('''
-            CREATE TABLE IF NOT EXISTS gearscore (
-                id SERIAL PRIMARY KEY,
-                user_id TEXT NOT NULL,
-                family_name TEXT NOT NULL,
-                class_pvp TEXT NOT NULL,
-                ap INTEGER NOT NULL,
-                aap INTEGER NOT NULL,
-                dp INTEGER NOT NULL,
-                linkgear TEXT NOT NULL,
-                updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
-                UNIQUE(user_id, class_pvp)
-            )
-        ''')
+        try:
+            cursor.execute('''
+                CREATE TABLE IF NOT EXISTS gearscore (
+                    id SERIAL PRIMARY KEY,
+                    user_id TEXT NOT NULL,
+                    family_name TEXT NOT NULL,
+                    character_name TEXT,
+                    class_pvp TEXT NOT NULL,
+                    ap INTEGER NOT NULL,
+                    aap INTEGER NOT NULL,
+                    dp INTEGER NOT NULL,
+                    linkgear TEXT NOT NULL,
+                    updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                    UNIQUE(user_id, class_pvp)
+                )
+            ''')
+        except Exception as e:
+            print(f"Aviso ao criar tabela gearscore: {e}")
+            conn.rollback()
         
         # Verificar se tabela gearscore_history existe
-        cursor.execute('''
-            SELECT EXISTS (
-                SELECT FROM information_schema.tables 
-                WHERE table_name = 'gearscore_history'
-            )
-        ''')
-        history_table_exists = cursor.fetchone()[0]
+        try:
+            cursor.execute('''
+                SELECT EXISTS (
+                    SELECT FROM information_schema.tables 
+                    WHERE table_name = 'gearscore_history'
+                )
+            ''')
+            history_table_exists = cursor.fetchone()[0]
+        except Exception:
+            history_table_exists = False
+            conn.rollback()
         
         if history_table_exists:
             # Verificar estrutura da tabela existente
@@ -170,12 +239,18 @@ class Database:
             ''')
         except Exception as e:
             print(f"Aviso ao criar índice: {e}")
+            conn.rollback()
         
-        conn.commit()
-        cursor.close()
-        conn.close()
+        try:
+            conn.commit()
+        except Exception as e:
+            print(f"Erro ao fazer commit: {e}")
+            conn.rollback()
+        finally:
+            cursor.close()
+            conn.close()
     
-    def register_gearscore(self, user_id, family_name, class_pvp, ap, aap, dp, linkgear):
+    def register_gearscore(self, user_id, family_name, class_pvp, ap, aap, dp, linkgear, character_name=None):
         """Registra um novo gearscore (primeira vez)"""
         conn = self.get_connection()
         cursor = conn.cursor()
@@ -194,9 +269,9 @@ class Database:
         # Inserir novo registro
         cursor.execute('''
             INSERT INTO gearscore 
-            (user_id, family_name, class_pvp, ap, aap, dp, linkgear, updated_at)
-            VALUES (%s, %s, %s, %s, %s, %s, %s, CURRENT_TIMESTAMP)
-        ''', (user_id, family_name, class_pvp, ap, aap, dp, linkgear))
+            (user_id, family_name, character_name, class_pvp, ap, aap, dp, linkgear, updated_at)
+            VALUES (%s, %s, %s, %s, %s, %s, %s, %s, CURRENT_TIMESTAMP)
+        ''', (user_id, family_name, character_name, class_pvp, ap, aap, dp, linkgear))
         
         # Salvar histórico
         total_gs = max(ap, aap) + dp
@@ -214,48 +289,89 @@ class Database:
         cursor.close()
         conn.close()
     
-    def update_gearscore(self, user_id, family_name, class_pvp, ap, aap, dp, linkgear):
+    def get_user_current_data(self, user_id):
+        """Retorna os dados atuais do usuário (family_name, character_name, class_pvp)"""
+        conn = self.get_connection()
+        cursor = conn.cursor()
+        cursor.execute('''
+            SELECT family_name, character_name, class_pvp FROM gearscore 
+            WHERE user_id = %s
+            LIMIT 1
+        ''', (user_id,))
+        result = cursor.fetchone()
+        cursor.close()
+        conn.close()
+        return result
+    
+    def update_gearscore(self, user_id, family_name=None, class_pvp=None, ap=None, aap=None, dp=None, linkgear=None, character_name=None):
         """Atualiza o gearscore de um personagem (pode mudar de classe)"""
         conn = self.get_connection()
         cursor = conn.cursor()
         
-        # Verificar se já existe registro para esta classe
-        cursor.execute('''
-            SELECT class_pvp FROM gearscore 
-            WHERE user_id = %s AND class_pvp = %s
-        ''', (user_id, class_pvp))
-        existing_same_class = cursor.fetchone()
+        # Buscar dados atuais
+        current_data = self.get_user_current_data(user_id)
+        if not current_data:
+            conn.close()
+            raise ValueError("Você ainda não possui um registro! Use /registro primeiro.")
         
-        # Se mudou de classe, remover registro da classe antiga
-        if not existing_same_class:
-            # Buscar classe antiga
+        current_family_name, current_character_name, current_class_pvp = current_data
+        
+        # Se não forneceu classe_pvp, usar a atual
+        if class_pvp is None:
+            class_pvp = current_class_pvp
+        
+        # Usar valores atuais se não fornecidos
+        if family_name is None:
+            family_name = current_family_name
+        
+        # character_name pode ser None se mudou de classe (personagem diferente)
+        # Se não foi fornecido e não mudou de classe, manter o atual
+        # Se mudou de classe e não forneceu, manter None (será limpo)
+        if character_name is None:
+            if class_pvp == current_class_pvp:
+                # Não mudou de classe, manter o nome atual
+                character_name = current_character_name
+            # Se mudou de classe, character_name permanece None (será limpo)
+        if ap is None or aap is None or dp is None or linkgear is None:
+            # Buscar valores atuais de AP, AAP, DP e linkgear
             cursor.execute('''
-                SELECT class_pvp FROM gearscore 
+                SELECT ap, aap, dp, linkgear FROM gearscore 
                 WHERE user_id = %s
             ''', (user_id,))
-            old_class = cursor.fetchone()
-            
-            if old_class:
-                # Remover registro da classe antiga
-                cursor.execute('''
-                    DELETE FROM gearscore 
-                    WHERE user_id = %s AND class_pvp = %s
-                ''', (user_id, old_class[0]))
+            current_values = cursor.fetchone()
+            if current_values:
+                if ap is None:
+                    ap = current_values[0]
+                if aap is None:
+                    aap = current_values[1]
+                if dp is None:
+                    dp = current_values[2]
+                if linkgear is None:
+                    linkgear = current_values[3]
+        
+        # Verificar se mudou de classe
+        if class_pvp != current_class_pvp:
+            # Remover registro da classe antiga
+            cursor.execute('''
+                DELETE FROM gearscore 
+                WHERE user_id = %s AND class_pvp = %s
+            ''', (user_id, current_class_pvp))
         
         # Atualizar ou inserir gearscore
         cursor.execute('''
             INSERT INTO gearscore 
-            (user_id, family_name, class_pvp, ap, aap, dp, linkgear, updated_at)
-            VALUES (%s, %s, %s, %s, %s, %s, %s, CURRENT_TIMESTAMP)
+            (user_id, family_name, character_name, class_pvp, ap, aap, dp, linkgear, updated_at)
+            VALUES (%s, %s, %s, %s, %s, %s, %s, %s, CURRENT_TIMESTAMP)
             ON CONFLICT (user_id, class_pvp) 
             DO UPDATE SET 
                 family_name = EXCLUDED.family_name,
+                character_name = EXCLUDED.character_name,
                 ap = EXCLUDED.ap,
                 aap = EXCLUDED.aap,
                 dp = EXCLUDED.dp,
                 linkgear = EXCLUDED.linkgear,
                 updated_at = CURRENT_TIMESTAMP
-        ''', (user_id, family_name, class_pvp, ap, aap, dp, linkgear))
+        ''', (user_id, family_name, character_name, class_pvp, ap, aap, dp, linkgear))
         
         # Salvar histórico
         total_gs = max(ap, aap) + dp
@@ -327,7 +443,7 @@ class Database:
         if valid_user_ids:
             placeholders = ','.join(['%s'] * len(valid_user_ids))
             query = f'''
-                SELECT id, user_id, family_name, class_pvp, ap, aap, dp, linkgear, updated_at
+                SELECT id, user_id, family_name, character_name, class_pvp, ap, aap, dp, linkgear, updated_at
                 FROM gearscore 
                 WHERE user_id IN ({placeholders})
                 ORDER BY updated_at DESC
@@ -335,7 +451,7 @@ class Database:
             cursor.execute(query, list(valid_user_ids))
         else:
             cursor.execute('''
-                SELECT id, user_id, family_name, class_pvp, ap, aap, dp, linkgear, updated_at
+                SELECT id, user_id, family_name, character_name, class_pvp, ap, aap, dp, linkgear, updated_at
                 FROM gearscore 
                 ORDER BY updated_at DESC
             ''')

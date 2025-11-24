@@ -21,6 +21,7 @@ class Database:
                 id INTEGER PRIMARY KEY AUTOINCREMENT,
                 user_id TEXT NOT NULL,
                 family_name TEXT NOT NULL,
+                character_name TEXT,
                 class_pvp TEXT NOT NULL,
                 ap INTEGER NOT NULL,
                 aap INTEGER NOT NULL,
@@ -30,6 +31,12 @@ class Database:
                 UNIQUE(user_id, class_pvp)
             )
         ''')
+        
+        # Adicionar coluna character_name se não existir (migração)
+        try:
+            cursor.execute('ALTER TABLE gearscore ADD COLUMN character_name TEXT')
+        except sqlite3.OperationalError:
+            pass  # Coluna já existe
         
         # Tabela de histórico para rastrear progressão
         cursor.execute('''
@@ -54,7 +61,7 @@ class Database:
         conn.commit()
         conn.close()
     
-    def register_gearscore(self, user_id, family_name, class_pvp, ap, aap, dp, linkgear):
+    def register_gearscore(self, user_id, family_name, class_pvp, ap, aap, dp, linkgear, character_name=None):
         """Registra um novo gearscore (primeira vez)"""
         conn = self.get_connection()
         cursor = conn.cursor()
@@ -73,9 +80,9 @@ class Database:
         # Inserir novo registro
         cursor.execute('''
             INSERT INTO gearscore 
-            (user_id, family_name, class_pvp, ap, aap, dp, linkgear, updated_at)
-            VALUES (?, ?, ?, ?, ?, ?, ?, CURRENT_TIMESTAMP)
-        ''', (user_id, family_name, class_pvp, ap, aap, dp, linkgear))
+            (user_id, family_name, character_name, class_pvp, ap, aap, dp, linkgear, updated_at)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, CURRENT_TIMESTAMP)
+        ''', (user_id, family_name, character_name, class_pvp, ap, aap, dp, linkgear))
         
         # Salvar histórico
         total_gs = max(ap, aap) + dp
@@ -88,40 +95,79 @@ class Database:
         conn.commit()
         conn.close()
     
-    def update_gearscore(self, user_id, family_name, class_pvp, ap, aap, dp, linkgear):
+    def get_user_current_data(self, user_id):
+        """Retorna os dados atuais do usuário (family_name, character_name, class_pvp)"""
+        conn = self.get_connection()
+        cursor = conn.cursor()
+        cursor.execute('''
+            SELECT family_name, character_name, class_pvp FROM gearscore 
+            WHERE user_id = ?
+            LIMIT 1
+        ''', (user_id,))
+        result = cursor.fetchone()
+        conn.close()
+        return result
+    
+    def update_gearscore(self, user_id, family_name=None, class_pvp=None, ap=None, aap=None, dp=None, linkgear=None, character_name=None):
         """Atualiza o gearscore de um personagem (pode mudar de classe)"""
         conn = self.get_connection()
         cursor = conn.cursor()
         
-        # Verificar se já existe registro para esta classe
-        cursor.execute('''
-            SELECT class_pvp FROM gearscore 
-            WHERE user_id = ? AND class_pvp = ?
-        ''', (user_id, class_pvp))
-        existing_same_class = cursor.fetchone()
+        # Buscar dados atuais
+        current_data = self.get_user_current_data(user_id)
+        if not current_data:
+            conn.close()
+            raise ValueError("Você ainda não possui um registro! Use /registro primeiro.")
         
-        # Se mudou de classe, remover registro da classe antiga
-        if not existing_same_class:
-            # Buscar classe antiga
+        current_family_name, current_character_name, current_class_pvp = current_data
+        
+        # Se não forneceu classe_pvp, usar a atual
+        if class_pvp is None:
+            class_pvp = current_class_pvp
+        
+        # Usar valores atuais se não fornecidos
+        if family_name is None:
+            family_name = current_family_name
+        
+        # character_name pode ser None se mudou de classe (personagem diferente)
+        # Se não foi fornecido e não mudou de classe, manter o atual
+        # Se mudou de classe e não forneceu, manter None (será limpo)
+        if character_name is None:
+            if class_pvp == current_class_pvp:
+                # Não mudou de classe, manter o nome atual
+                character_name = current_character_name
+            # Se mudou de classe, character_name permanece None (será limpo)
+        if ap is None or aap is None or dp is None or linkgear is None:
+            # Buscar valores atuais de AP, AAP, DP e linkgear
             cursor.execute('''
-                SELECT class_pvp FROM gearscore 
+                SELECT ap, aap, dp, linkgear FROM gearscore 
                 WHERE user_id = ?
             ''', (user_id,))
-            old_class = cursor.fetchone()
-            
-            if old_class:
-                # Remover registro da classe antiga
-                cursor.execute('''
-                    DELETE FROM gearscore 
-                    WHERE user_id = ? AND class_pvp = ?
-                ''', (user_id, old_class[0]))
+            current_values = cursor.fetchone()
+            if current_values:
+                if ap is None:
+                    ap = current_values[0]
+                if aap is None:
+                    aap = current_values[1]
+                if dp is None:
+                    dp = current_values[2]
+                if linkgear is None:
+                    linkgear = current_values[3]
+        
+        # Verificar se mudou de classe
+        if class_pvp != current_class_pvp:
+            # Remover registro da classe antiga
+            cursor.execute('''
+                DELETE FROM gearscore 
+                WHERE user_id = ? AND class_pvp = ?
+            ''', (user_id, current_class_pvp))
         
         # Atualizar ou inserir gearscore
         cursor.execute('''
             INSERT OR REPLACE INTO gearscore 
-            (user_id, family_name, class_pvp, ap, aap, dp, linkgear, updated_at)
-            VALUES (?, ?, ?, ?, ?, ?, ?, CURRENT_TIMESTAMP)
-        ''', (user_id, family_name, class_pvp, ap, aap, dp, linkgear))
+            (user_id, family_name, character_name, class_pvp, ap, aap, dp, linkgear, updated_at)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, CURRENT_TIMESTAMP)
+        ''', (user_id, family_name, character_name, class_pvp, ap, aap, dp, linkgear))
         
         # Salvar histórico
         total_gs = max(ap, aap) + dp

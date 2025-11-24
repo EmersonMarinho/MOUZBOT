@@ -26,7 +26,7 @@ class Database:
             [("user_id", 1), ("class_pvp", 1), ("created_at", -1)]
         )
     
-    def register_gearscore(self, user_id, family_name, class_pvp, ap, aap, dp, linkgear):
+    def register_gearscore(self, user_id, family_name, class_pvp, ap, aap, dp, linkgear, character_name=None):
         """Registra um novo gearscore (primeira vez)"""
         # Verificar se já existe registro para esta classe
         existing = self.collection.find_one({
@@ -41,6 +41,7 @@ class Database:
         document = {
             "user_id": user_id,
             "family_name": family_name,
+            "character_name": character_name,
             "class_pvp": class_pvp,
             "ap": ap,
             "aap": aap,
@@ -65,29 +66,70 @@ class Database:
         }
         self.history_collection.insert_one(history_doc)
     
-    def update_gearscore(self, user_id, family_name, class_pvp, ap, aap, dp, linkgear):
+    def get_user_current_data(self, user_id):
+        """Retorna os dados atuais do usuário (family_name, character_name, class_pvp)"""
+        result = self.collection.find_one({"user_id": user_id})
+        if result:
+            return (
+                result.get("family_name"),
+                result.get("character_name"),
+                result.get("class_pvp")
+            )
+        return None
+    
+    def update_gearscore(self, user_id, family_name=None, class_pvp=None, ap=None, aap=None, dp=None, linkgear=None, character_name=None):
         """Atualiza o gearscore de um personagem (pode mudar de classe)"""
-        # Verificar se já existe registro para esta classe
-        existing_same_class = self.collection.find_one({
-            "user_id": user_id,
-            "class_pvp": class_pvp
-        })
+        # Buscar dados atuais
+        current_record = self.collection.find_one({"user_id": user_id})
+        if not current_record:
+            raise ValueError("Você ainda não possui um registro! Use /registro primeiro.")
         
-        # Se mudou de classe, remover registro da classe antiga
-        if not existing_same_class:
-            # Buscar classe antiga
-            old_record = self.collection.find_one({"user_id": user_id})
-            if old_record and old_record.get("class_pvp") != class_pvp:
-                # Remover registro da classe antiga
-                self.collection.delete_one({
-                    "user_id": user_id,
-                    "class_pvp": old_record["class_pvp"]
-                })
+        current_family_name = current_record.get("family_name")
+        current_character_name = current_record.get("character_name")
+        current_class_pvp = current_record.get("class_pvp")
+        current_ap = current_record.get("ap")
+        current_aap = current_record.get("aap")
+        current_dp = current_record.get("dp")
+        current_linkgear = current_record.get("linkgear")
+        
+        # Se não forneceu classe_pvp, usar a atual
+        if class_pvp is None:
+            class_pvp = current_class_pvp
+        
+        # Usar valores atuais se não fornecidos
+        if family_name is None:
+            family_name = current_family_name
+        
+        # character_name pode ser None se mudou de classe (personagem diferente)
+        # Se não foi fornecido e não mudou de classe, manter o atual
+        # Se mudou de classe e não forneceu, manter None (será limpo)
+        if character_name is None:
+            if class_pvp == current_class_pvp:
+                # Não mudou de classe, manter o nome atual
+                character_name = current_character_name
+            # Se mudou de classe, character_name permanece None (será limpo)
+        if ap is None:
+            ap = current_ap
+        if aap is None:
+            aap = current_aap
+        if dp is None:
+            dp = current_dp
+        if linkgear is None:
+            linkgear = current_linkgear
+        
+        # Verificar se mudou de classe
+        if class_pvp != current_class_pvp:
+            # Remover registro da classe antiga
+            self.collection.delete_one({
+                "user_id": user_id,
+                "class_pvp": current_class_pvp
+            })
         
         # Atualizar ou inserir gearscore
         document = {
             "user_id": user_id,
             "family_name": family_name,
+            "character_name": character_name,
             "class_pvp": class_pvp,
             "ap": ap,
             "aap": aap,

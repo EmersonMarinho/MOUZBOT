@@ -199,7 +199,7 @@ async def on_message(message: discord.Message):
             embed.add_field(
                 name="📊 Comandos de Gearscore",
                 value="`/atualizar_gearscore` - Atualiza seu gearscore\n"
-                      "`/ver_gearscore` - Visualiza seu gearscore\n"
+                      "`/perfil` - Visualiza seu perfil completo\n"
                       "`/gearscore_dm` - Recebe gearscore via DM\n"
                       "`/ranking_gearscore` - Ver ranking\n"
                       "`/estatisticas_classes` - Estatísticas das classes",
@@ -240,6 +240,7 @@ async def classe_autocomplete(
 @bot.tree.command(name="registro", description="Registra seu gearscore pela primeira vez")
 @app_commands.describe(
     nome_familia="Nome da família do personagem",
+    nome_personagem="Nome do personagem",
     classe_pvp="Classe PVP do personagem (digite para buscar)",
     ap="Attack Power (AP)",
     aap="Awakened Attack Power (AAP)",
@@ -250,6 +251,7 @@ async def classe_autocomplete(
 async def registro(
     interaction: discord.Interaction,
     nome_familia: str,
+    nome_personagem: str,
     classe_pvp: str,
     ap: int,
     aap: int,
@@ -299,6 +301,7 @@ async def registro(
         db.register_gearscore(
             user_id=user_id,
             family_name=nome_familia,
+            character_name=nome_personagem,
             class_pvp=classe_pvp,
             ap=ap,
             aap=aap,
@@ -336,6 +339,7 @@ async def registro(
             timestamp=discord.utils.utcnow()
         )
         embed.add_field(name="👤 Família", value=nome_familia, inline=True)
+        embed.add_field(name="👤 Personagem", value=nome_personagem, inline=True)
         embed.add_field(name="🎭 Classe PVP", value=classe_pvp, inline=True)
         embed.add_field(name="⚔️ AP", value=f"{ap}", inline=True)
         embed.add_field(name="🔥 AAP", value=f"{aap}", inline=True)
@@ -382,9 +386,11 @@ async def registro(
                 ephemeral=True
             )
 
-@bot.tree.command(name="atualizar", description="Atualiza seu gearscore (pode mudar de classe)")
+@bot.tree.command(name="registro_manual", description="[ADMIN] Registra gearscore manualmente para outro membro")
 @app_commands.describe(
+    usuario="Usuário do Discord para registrar",
     nome_familia="Nome da família do personagem",
+    nome_personagem="Nome do personagem",
     classe_pvp="Classe PVP do personagem (digite para buscar)",
     ap="Attack Power (AP)",
     aap="Awakened Attack Power (AAP)",
@@ -392,15 +398,26 @@ async def registro(
     linkgear="Link do gear (obrigatório)"
 )
 @app_commands.autocomplete(classe_pvp=classe_autocomplete)
-async def atualizar(
+@app_commands.default_permissions(administrator=True)
+async def registro_manual(
     interaction: discord.Interaction,
+    usuario: discord.Member,
     nome_familia: str,
+    nome_personagem: str,
     classe_pvp: str,
     ap: int,
     aap: int,
     dp: int,
     linkgear: str
 ):
+    """Registra gearscore manualmente para outro membro (apenas administradores)"""
+    if not interaction.user.guild_permissions.administrator:
+        await interaction.response.send_message(
+            "❌ Apenas administradores podem usar este comando!",
+            ephemeral=True
+        )
+        return
+    
     # Validar valores numéricos
     if ap < 0 or aap < 0 or dp < 0:
         await interaction.response.send_message(
@@ -427,16 +444,259 @@ async def atualizar(
         return
     
     try:
+        # Verificar se é em um servidor (não DM)
+        if not interaction.guild:
+            await interaction.response.send_message(
+                "❌ Este comando só pode ser usado em um servidor!",
+                ephemeral=True
+            )
+            return
+        
+        # Deferir resposta se a operação pode demorar
+        await interaction.response.defer(ephemeral=True)
+        
+        target_user_id = str(usuario.id)
+        
+        # Registrar gearscore para o usuário selecionado
+        db.register_gearscore(
+            user_id=target_user_id,
+            family_name=nome_familia,
+            character_name=nome_personagem,
+            class_pvp=classe_pvp,
+            ap=ap,
+            aap=aap,
+            dp=dp,
+            linkgear=linkgear
+        )
+        
+        # Adicionar cargo da guilda ao membro selecionado
+        member = interaction.guild.get_member(usuario.id)
+        role_added = False
+        role_error = None
+        
+        if member:
+            role = interaction.guild.get_role(GUILD_MEMBER_ROLE_ID)
+            if role:
+                try:
+                    if not has_guild_role(member):
+                        await member.add_roles(role, reason=f"Registro manual de gearscore por {interaction.user.display_name}")
+                        role_added = True
+                except discord.Forbidden:
+                    role_error = "Sem permissão para adicionar cargo"
+                except discord.HTTPException as e:
+                    role_error = f"Erro ao adicionar cargo: {str(e)}"
+            else:
+                role_error = "Cargo da guilda não encontrado no servidor"
+        else:
+            role_error = "Membro não encontrado no servidor"
+        
+        # Calcular GS total (MAX(AP, AAP) + DP)
+        gs_total = calculate_gs(ap, aap, dp)
+        
+        embed = discord.Embed(
+            title="✅ Gearscore Registrado Manualmente!",
+            color=discord.Color.green(),
+            timestamp=discord.utils.utcnow()
+        )
+        embed.add_field(name="👤 Usuário", value=usuario.mention, inline=True)
+        embed.add_field(name="👤 Família", value=nome_familia, inline=True)
+        embed.add_field(name="👤 Personagem", value=nome_personagem, inline=True)
+        embed.add_field(name="🎭 Classe PVP", value=classe_pvp, inline=True)
+        embed.add_field(name="⚔️ AP", value=f"{ap}", inline=True)
+        embed.add_field(name="🔥 AAP", value=f"{aap}", inline=True)
+        embed.add_field(name="🛡️ DP", value=f"{dp}", inline=True)
+        embed.add_field(name="📊 GS Total", value=f"**{gs_total}** (MAX({ap}, {aap}) + {dp})", inline=False)
+        embed.add_field(name="🔗 Link Gear", value=linkgear, inline=False)
+        
+        if role_added:
+            embed.add_field(name="🎖️ Cargo", value="Cargo da guilda atribuído com sucesso!", inline=False)
+        elif role_error:
+            embed.add_field(name="⚠️ Aviso", value=f"Não foi possível adicionar o cargo: {role_error}", inline=False)
+        
+        embed.set_footer(text=f"Registrado manualmente por {interaction.user.display_name}")
+        
+        await interaction.followup.send(embed=embed, ephemeral=True)
+        
+        # Enviar notificação ao canal
+        try:
+            channel = bot.get_channel(NOTIFICATION_CHANNEL_ID)
+            if not channel:
+                channel = await bot.fetch_channel(NOTIFICATION_CHANNEL_ID)
+            
+            if channel:
+                gs_total = calculate_gs(ap, aap, dp)
+                
+                embed = discord.Embed(
+                    title="✅ Novo Gearscore Registrado Manualmente!",
+                    color=discord.Color.green(),
+                    timestamp=discord.utils.utcnow()
+                )
+                embed.add_field(name="👤 Usuário", value=usuario.mention, inline=True)
+                embed.add_field(name="👤 Família", value=nome_familia, inline=True)
+                embed.add_field(name="👤 Personagem", value=nome_personagem, inline=True)
+                embed.add_field(name="🎭 Classe PVP", value=classe_pvp, inline=True)
+                embed.add_field(name="⚔️ AP", value=f"{ap}", inline=True)
+                embed.add_field(name="🔥 AAP", value=f"{aap}", inline=True)
+                embed.add_field(name="🛡️ DP", value=f"{dp}", inline=True)
+                embed.add_field(name="📊 GS Total", value=f"**{gs_total}** (MAX({ap}, {aap}) + {dp})", inline=False)
+                embed.add_field(name="🔗 Link Gear", value=linkgear, inline=False)
+                embed.set_footer(text=f"Registrado manualmente por {interaction.user.display_name}")
+                
+                await channel.send(embed=embed)
+        except Exception as e:
+            print(f"Erro ao enviar notificação: {e}")
+        
+        # Enviar DM para o usuário informando sobre o registro manual
+        try:
+            dm_embed = discord.Embed(
+                title="✅ Gearscore Registrado",
+                description=f"Seu gearscore foi registrado manualmente por um administrador.",
+                color=discord.Color.blue(),
+                timestamp=discord.utils.utcnow()
+            )
+            dm_embed.add_field(name="👤 Família", value=nome_familia, inline=True)
+            dm_embed.add_field(name="👤 Personagem", value=nome_personagem, inline=True)
+            dm_embed.add_field(name="🎭 Classe PVP", value=classe_pvp, inline=True)
+            dm_embed.add_field(name="📊 GS Total", value=f"**{gs_total}**", inline=False)
+            dm_embed.set_footer(text="Use /perfil para ver seu perfil completo")
+            await usuario.send(embed=dm_embed)
+        except discord.Forbidden:
+            # Usuário bloqueou DMs, não é problema
+            pass
+        except Exception as e:
+            # Erro ao enviar DM, não é crítico
+            print(f"Erro ao enviar DM para {usuario.id}: {e}")
+        
+    except ValueError as e:
+        # Verificar se já respondeu
+        if interaction.response.is_done():
+            await interaction.followup.send(
+                f"❌ {str(e)}",
+                ephemeral=True
+            )
+        else:
+            await interaction.response.send_message(
+                f"❌ {str(e)}",
+                ephemeral=True
+            )
+    except Exception as e:
+        # Verificar se já respondeu
+        if interaction.response.is_done():
+            await interaction.followup.send(
+                f"❌ Erro ao registrar gearscore: {str(e)}",
+                ephemeral=True
+            )
+        else:
+            await interaction.response.send_message(
+                f"❌ Erro ao registrar gearscore: {str(e)}",
+                ephemeral=True
+            )
+
+@bot.tree.command(name="atualizar", description="Atualiza seu gearscore (pode mudar de classe)")
+@app_commands.describe(
+    ap="Attack Power (AP) - Obrigatório",
+    aap="Awakened Attack Power (AAP) - Obrigatório",
+    dp="Defense Power (DP) - Obrigatório",
+    linkgear="Link do gear - Obrigatório",
+    nome_familia="Nome da família do personagem (opcional se já cadastrado)",
+    nome_personagem="Nome do personagem (opcional se já cadastrado)",
+    classe_pvp="Classe PVP do personagem (opcional se já cadastrado, digite para buscar)"
+)
+@app_commands.autocomplete(classe_pvp=classe_autocomplete)
+async def atualizar(
+    interaction: discord.Interaction,
+    ap: int,
+    aap: int,
+    dp: int,
+    linkgear: str,
+    nome_familia: str = None,
+    nome_personagem: str = None,
+    classe_pvp: str = None
+):
+    # Validar valores numéricos
+    if ap < 0 or aap < 0 or dp < 0:
+        await interaction.response.send_message(
+            "❌ Os valores de AP, AAP e DP devem ser números positivos!",
+            ephemeral=True
+        )
+        return
+    
+    # Validar linkgear
+    if not linkgear or linkgear.strip() == "":
+        await interaction.response.send_message(
+            "❌ O link do gear é obrigatório!",
+            ephemeral=True
+        )
+        return
+    
+    try:
         user_id = str(interaction.user.id)
         
         # Verificar se já existe registro (operação rápida)
-        current_class = db.get_user_current_class(user_id)
-        if not current_class:
+        current_data = db.get_user_current_data(user_id)
+        if not current_data:
             await interaction.response.send_message(
                 "❌ Você ainda não possui um registro! Use `/registro` primeiro.",
                 ephemeral=True
             )
             return
+        
+        current_family_name, current_character_name, current_class_pvp = current_data
+        
+        # Validar classe PVP se fornecida
+        if classe_pvp and classe_pvp not in BDO_CLASSES:
+            classes_str = ", ".join(BDO_CLASSES[:10])  # Mostrar primeiras 10
+            await interaction.response.send_message(
+                f"❌ Classe inválida! Classes disponíveis: {classes_str}... (use autocomplete para ver todas)",
+                ephemeral=True
+            )
+            return
+        
+        # Se não forneceu classe_pvp, usar a atual
+        if classe_pvp is None:
+            classe_pvp = current_class_pvp
+        
+        # Se não forneceu nome_familia, usar o atual
+        if nome_familia is None:
+            nome_familia = current_family_name
+        
+        # Se mudou de classe, o nome do personagem é OBRIGATÓRIO (é um personagem diferente)
+        if classe_pvp != current_class_pvp:
+            if nome_personagem is None or nome_personagem.strip() == "":
+                # Mudou de classe mas não forneceu nome do personagem
+                # Enviar DM solicitando o nome do personagem
+                try:
+                    dm_embed = discord.Embed(
+                        title="⚠️ Nome do Personagem Obrigatório",
+                        description=f"Você está mudando de classe de **{current_class_pvp}** para **{classe_pvp}**.\n\n"
+                                   f"Como você está mudando para um personagem diferente, é **obrigatório** fornecer o nome do novo personagem.\n\n"
+                                   f"Por favor, use o comando `/atualizar` novamente incluindo o parâmetro `nome_personagem` com o nome do seu novo personagem.",
+                        color=discord.Color.orange(),
+                        timestamp=discord.utils.utcnow()
+                    )
+                    dm_embed.add_field(
+                        name="📝 Exemplo",
+                        value=f"`/atualizar ap:300 aap:280 dp:400 linkgear:https://... nome_personagem:NovoNome classe_pvp:{classe_pvp}`",
+                        inline=False
+                    )
+                    await interaction.user.send(embed=dm_embed)
+                except discord.Forbidden:
+                    # Se não conseguir enviar DM, mostrar erro no canal
+                    pass
+                
+                await interaction.response.send_message(
+                    f"❌ **Nome do personagem obrigatório!**\n\n"
+                    f"Você está mudando de classe de **{current_class_pvp}** para **{classe_pvp}**.\n"
+                    f"Como você está mudando para um personagem diferente, é **obrigatório** fornecer o nome do novo personagem.\n\n"
+                    f"Por favor, use o comando `/atualizar` novamente incluindo o parâmetro `nome_personagem`.\n\n"
+                    f"**Exemplo:** `/atualizar ap:{ap} aap:{aap} dp:{dp} linkgear:{linkgear} nome_personagem:NovoNome classe_pvp:{classe_pvp}`",
+                    ephemeral=True
+                )
+                return
+        
+        # Se não mudou de classe e não forneceu nome_personagem, manter o atual
+        if nome_personagem is None:
+            nome_personagem = current_character_name
         
         # Deferir resposta antes de operações que podem demorar (privado)
         await interaction.response.defer(ephemeral=True)
@@ -445,6 +705,7 @@ async def atualizar(
         db.update_gearscore(
             user_id=user_id,
             family_name=nome_familia,
+            character_name=nome_personagem,
             class_pvp=classe_pvp,
             ap=ap,
             aap=aap,
@@ -461,6 +722,8 @@ async def atualizar(
             timestamp=discord.utils.utcnow()
         )
         embed.add_field(name="👤 Família", value=nome_familia, inline=True)
+        if nome_personagem:
+            embed.add_field(name="👤 Personagem", value=nome_personagem, inline=True)
         embed.add_field(name="🎭 Classe PVP", value=classe_pvp, inline=True)
         embed.add_field(name="⚔️ AP", value=f"{ap}", inline=True)
         embed.add_field(name="🔥 AAP", value=f"{aap}", inline=True)
@@ -468,10 +731,10 @@ async def atualizar(
         embed.add_field(name="📊 GS Total", value=f"**{gs_total}** (MAX({ap}, {aap}) + {dp})", inline=False)
         embed.add_field(name="🔗 Link Gear", value=linkgear, inline=False)
         
-        if current_class != classe_pvp:
+        if current_class_pvp != classe_pvp:
             embed.add_field(
                 name="🔄 Mudança de Classe",
-                value=f"Classe alterada de **{current_class}** para **{classe_pvp}**",
+                value=f"Classe alterada de **{current_class_pvp}** para **{classe_pvp}**",
                 inline=False
             )
         
@@ -497,64 +760,323 @@ async def atualizar(
                 ephemeral=True
             )
 
-@bot.tree.command(name="ver_gearscore", description="Visualiza o seu gearscore")
-async def ver_gearscore(interaction: discord.Interaction):
+# Função auxiliar para gerar perfil (reutilizável)
+async def generate_profile_embed(interaction: discord.Interaction, target_user: discord.Member, target_user_id: str = None):
+    """Gera o embed do perfil de um usuário"""
+    if target_user_id is None:
+        target_user_id = str(target_user.id)
+    
+    results = db.get_gearscore(target_user_id)
+    
+    if not results:
+        return None
+    
+    # Agora só pode ter 1 resultado (1 classe por usuário)
+    result = results[0]
+    
+    # Formatar dados dependendo do banco
+    if isinstance(result, dict):
+        family_name = result.get('family_name', 'N/A')
+        character_name = result.get('character_name', family_name)
+        class_pvp = result.get('class_pvp', 'N/A')
+        ap = result.get('ap', 0)
+        aap = result.get('aap', 0)
+        dp = result.get('dp', 0)
+        linkgear = result.get('linkgear', 'N/A')
+        updated_at = result.get('updated_at', 'N/A')
+    else:
+        # SQLite/PostgreSQL: id, user_id, family_name, class_pvp, ap, aap, dp, linkgear, updated_at
+        family_name = result[2] if len(result) > 2 else 'N/A'
+        character_name = family_name
+        class_pvp = result[3] if len(result) > 3 else 'N/A'
+        ap = result[4] if len(result) > 4 else 0
+        aap = result[5] if len(result) > 5 else 0
+        dp = result[6] if len(result) > 6 else 0
+        linkgear = result[7] if len(result) > 7 else 'N/A'
+        updated_at = result[8] if len(result) > 8 else 'N/A'
+    
+    gs_total = calculate_gs(ap, aap, dp)
+    
+    # Buscar histórico para verificar se foi criado ou atualizado
     try:
-        user_id = str(interaction.user.id)
-        results = db.get_gearscore(user_id)
+        history = db.get_user_history(target_user_id, class_pvp)
+        is_created = len(history) == 1 if history else True
+    except:
+        is_created = False
+    
+    # Formatar data
+    def format_date(date_str):
+        """Formata data para DD/MM/YYYY - HH:MM"""
+        try:
+            if isinstance(date_str, str) and date_str != 'N/A':
+                from datetime import datetime
+                formats = [
+                    '%Y-%m-%d %H:%M:%S',
+                    '%Y-%m-%d %H:%M:%S.%f',
+                    '%Y-%m-%dT%H:%M:%S',
+                    '%Y-%m-%dT%H:%M:%S.%f',
+                    '%Y-%m-%dT%H:%M:%S.%fZ'
+                ]
+                for fmt in formats:
+                    try:
+                        dt = datetime.strptime(date_str, fmt)
+                        return dt.strftime('%d/%m/%Y - %H:%M')
+                    except:
+                        continue
+                return date_str
+            elif hasattr(date_str, 'strftime'):
+                return date_str.strftime('%d/%m/%Y - %H:%M')
+            return str(date_str)
+        except:
+            return str(date_str) if date_str else 'N/A'
+    
+    date_label = "Criado em" if is_created else "Atualizado em"
+    formatted_date = format_date(updated_at)
+    
+    # Buscar membros da guilda para calcular ranking e médias
+    valid_user_ids = await get_guild_member_ids(interaction.guild)
+    all_gearscores = db.get_all_gearscores(valid_user_ids=valid_user_ids)
+    
+    # Calcular ranking
+    def get_gs_from_result(result):
+        if isinstance(result, dict):
+            ap_val = result.get('ap', 0)
+            aap_val = result.get('aap', 0)
+            dp_val = result.get('dp', 0)
+        else:
+            ap_val = result[4] if len(result) > 4 else 0
+            aap_val = result[5] if len(result) > 5 else 0
+            dp_val = result[6] if len(result) > 6 else 0
+        return calculate_gs(ap_val, aap_val, dp_val)
+    
+    sorted_gearscores = sorted(all_gearscores, key=get_gs_from_result, reverse=True)
+    
+    # Encontrar posição no ranking
+    ranking_position = None
+    for idx, gs_result in enumerate(sorted_gearscores, 1):
+        if isinstance(gs_result, dict):
+            gs_user_id = str(gs_result.get('user_id', ''))
+        else:
+            gs_user_id = str(gs_result[1] if len(gs_result) > 1 else '')
         
-        if not results:
+        if gs_user_id == target_user_id:
+            ranking_position = idx
+            break
+    
+    # Buscar estatísticas da guilda
+    stats = db.get_class_statistics(valid_user_ids=valid_user_ids)
+    
+    # Calcular média geral (Mouz)
+    total_chars = 0
+    total_weighted_gs = 0
+    class_avg_gs = 0
+    
+    for stat in stats:
+        if isinstance(stat, dict):
+            class_name = stat.get('class_pvp', 'Desconhecida')
+            total = stat.get('total', 0)
+            avg_gs = stat.get('avg_gs', 0)
+        else:
+            class_name = stat[0]
+            total = stat[1]
+            avg_gs = float(stat[2]) if len(stat) > 2 and stat[2] is not None else 0
+        
+        total_chars += total
+        total_weighted_gs += avg_gs * total
+        
+        # Buscar média da classe específica
+        if class_name.lower() == class_pvp.lower():
+            class_avg_gs = avg_gs
+    
+    overall_avg_gs = int(round(total_weighted_gs / total_chars)) if total_chars > 0 else 0
+    class_avg_gs_int = int(round(class_avg_gs)) if class_avg_gs > 0 else 0
+    
+    # Comparar com médias
+    media_mouz_status = "Acima" if gs_total >= overall_avg_gs else "Abaixo"
+    media_classe_status = "Acima" if gs_total >= class_avg_gs_int else "Abaixo"
+    
+    # Criar embed com layout similar à imagem
+    embed = discord.Embed(
+        title=f"{family_name}",
+        color=discord.Color.blue(),
+        timestamp=discord.utils.utcnow()
+    )
+    
+    # Adicionar avatar do usuário
+    embed.set_thumbnail(url=target_user.display_avatar.url)
+    
+    # Coluna esquerda
+    embed.add_field(
+        name="📄 Família",
+        value=family_name,
+        inline=True
+    )
+    
+    embed.add_field(
+        name="👤 Personagem",
+        value=character_name,
+        inline=True
+    )
+    
+    embed.add_field(
+        name="🏛️ Guilda",
+        value=interaction.guild.name,
+        inline=True
+    )
+    
+    # Nova linha - Classe e AP/AAP
+    embed.add_field(
+        name="⚔️ Classe PvP",
+        value=class_pvp,
+        inline=True
+    )
+    
+    embed.add_field(
+        name="⚔️ AP Pre/Succ",
+        value=str(ap),
+        inline=True
+    )
+    
+    embed.add_field(
+        name="🔥 AP Awakening",
+        value=str(aap),
+        inline=True
+    )
+    
+    # Nova linha - DP, GS e Ranking
+    embed.add_field(
+        name="🛡️ DP",
+        value=str(dp),
+        inline=True
+    )
+    
+    embed.add_field(
+        name="🏆 Gearscore",
+        value=f"**{gs_total}**",
+        inline=True
+    )
+    
+    if ranking_position:
+        embed.add_field(
+            name="📊 Posição GS",
+            value=f"**{ranking_position}°**",
+            inline=True
+        )
+    else:
+        embed.add_field(
+            name="📊 Posição GS",
+            value="N/A",
+            inline=True
+        )
+    
+    # Nova linha - Médias
+    embed.add_field(
+        name="📊 Média Mouz",
+        value=f"{media_mouz_status} ✅" if media_mouz_status == "Acima" else f"{media_mouz_status} ❌",
+        inline=True
+    )
+    
+    embed.add_field(
+        name=f"📊 Média ({class_pvp})",
+        value=f"{media_classe_status} ✅" if media_classe_status == "Acima" else f"{media_classe_status} ❌",
+        inline=True
+    )
+    
+    embed.add_field(
+        name="🔗 Link Gear",
+        value=f"[Clique aqui]({linkgear})" if linkgear != 'N/A' and linkgear.startswith('http') else linkgear,
+        inline=True
+    )
+    
+    # Footer com informações resumidas
+    footer_text = f"{class_pvp} {gs_total}gs | {date_label} {formatted_date}"
+    embed.set_footer(text=footer_text)
+    
+    return embed
+
+@bot.tree.command(name="perfil", description="Visualiza o seu perfil completo de gearscore")
+async def perfil(interaction: discord.Interaction):
+    try:
+        # Verificar se é em um servidor
+        if not interaction.guild:
             await interaction.response.send_message(
+                "❌ Este comando só pode ser usado em um servidor!",
+                ephemeral=True
+            )
+            return
+        
+        await interaction.response.defer(ephemeral=True)
+        
+        # Gerar perfil do próprio usuário
+        embed = await generate_profile_embed(interaction, interaction.user)
+        
+        if embed is None:
+            await interaction.followup.send(
                 "❌ Nenhum gearscore encontrado! Use `/registro` para registrar seu gearscore.",
                 ephemeral=True
             )
             return
         
-        # Agora só pode ter 1 resultado (1 classe por usuário)
-        result = results[0]
-        
-        # Formatar dados dependendo do banco
-        if isinstance(result, dict):
-            family_name = result.get('family_name', 'N/A')
-            class_pvp = result.get('class_pvp', 'N/A')
-            ap = result.get('ap', 0)
-            aap = result.get('aap', 0)
-            dp = result.get('dp', 0)
-            linkgear = result.get('linkgear', 'N/A')
-            updated_at = result.get('updated_at', 'N/A')
-        else:
-            # SQLite/PostgreSQL: id, user_id, family_name, class_pvp, ap, aap, dp, linkgear, updated_at
-            family_name = result[2] if len(result) > 2 else 'N/A'
-            class_pvp = result[3] if len(result) > 3 else 'N/A'
-            ap = result[4] if len(result) > 4 else 0
-            aap = result[5] if len(result) > 5 else 0
-            dp = result[6] if len(result) > 6 else 0
-            linkgear = result[7] if len(result) > 7 else 'N/A'
-            updated_at = result[8] if len(result) > 8 else 'N/A'
-        
-        gs_total = calculate_gs(ap, aap, dp)
-        
-        embed = discord.Embed(
-            title=f"📊 Gearscore - {class_pvp}",
-            color=discord.Color.blue(),
-            timestamp=discord.utils.utcnow()
-        )
-        embed.add_field(name="👤 Família", value=family_name, inline=True)
-        embed.add_field(name="🎭 Classe PVP", value=class_pvp, inline=True)
-        embed.add_field(name="⚔️ AP", value=f"{ap}", inline=True)
-        embed.add_field(name="🔥 AAP", value=f"{aap}", inline=True)
-        embed.add_field(name="🛡️ DP", value=f"{dp}", inline=True)
-        embed.add_field(name="📊 GS Total", value=f"**{gs_total}** (MAX({ap}, {aap}) + {dp})", inline=False)
-        embed.add_field(name="🔗 Link Gear", value=linkgear, inline=False)
-        embed.set_footer(text=f"Última atualização: {updated_at}")
-        
-        await interaction.response.send_message(embed=embed, ephemeral=True)
+        await interaction.followup.send(embed=embed, ephemeral=True)
             
     except Exception as e:
+        if interaction.response.is_done():
+            await interaction.followup.send(
+                f"❌ Erro ao buscar perfil: {str(e)}",
+                ephemeral=True
+            )
+        else:
+            await interaction.response.send_message(
+                f"❌ Erro ao buscar perfil: {str(e)}",
+                ephemeral=True
+            )
+
+@bot.tree.command(name="pre", description="[ADMIN] Visualiza o perfil de outro membro")
+@app_commands.describe(usuario="Usuário para visualizar o perfil")
+@app_commands.default_permissions(administrator=True)
+async def pre(interaction: discord.Interaction, usuario: discord.Member):
+    """Visualiza o perfil de outro membro (apenas administradores)"""
+    if not interaction.user.guild_permissions.administrator:
         await interaction.response.send_message(
-            f"❌ Erro ao buscar gearscore: {str(e)}",
+            "❌ Apenas administradores podem usar este comando!",
             ephemeral=True
         )
+        return
+    
+    try:
+        # Verificar se é em um servidor
+        if not interaction.guild:
+            await interaction.response.send_message(
+                "❌ Este comando só pode ser usado em um servidor!",
+                ephemeral=True
+            )
+            return
+        
+        await interaction.response.defer(ephemeral=True)
+        
+        # Gerar perfil do usuário especificado
+        embed = await generate_profile_embed(interaction, usuario)
+        
+        if embed is None:
+            await interaction.followup.send(
+                f"❌ Nenhum gearscore encontrado para {usuario.mention}!",
+                ephemeral=True
+            )
+            return
+        
+        await interaction.followup.send(embed=embed, ephemeral=True)
+            
+    except Exception as e:
+        if interaction.response.is_done():
+            await interaction.followup.send(
+                f"❌ Erro ao buscar perfil: {str(e)}",
+                ephemeral=True
+            )
+        else:
+            await interaction.response.send_message(
+                f"❌ Erro ao buscar perfil: {str(e)}",
+                ephemeral=True
+            )
 
 @bot.tree.command(name="estatisticas_classes", description="[ADMIN] Mostra estatísticas das classes na guilda")
 @app_commands.default_permissions(administrator=True)
@@ -589,6 +1111,8 @@ async def estatisticas_classes(interaction: discord.Interaction):
         # Calcular GS médio geral
         total_chars = 0
         total_weighted_gs = 0
+        total_chars_sem_shai = 0
+        total_weighted_gs_sem_shai = 0
         stats_list = []
         
         for stat in stats:
@@ -604,10 +1128,19 @@ async def estatisticas_classes(interaction: discord.Interaction):
             
             total_chars += total
             total_weighted_gs += avg_gs * total
+            
+            # Calcular GS médio sem Shai
+            if class_name.lower() != 'shai':
+                total_chars_sem_shai += total
+                total_weighted_gs_sem_shai += avg_gs * total
+            
             stats_list.append((class_name, total, avg_gs))
         
         # Calcular GS médio geral (média ponderada)
         overall_avg_gs = int(round(total_weighted_gs / total_chars)) if total_chars > 0 else 0
+        
+        # Calcular GS médio sem Shai (média ponderada)
+        overall_avg_gs_sem_shai = int(round(total_weighted_gs_sem_shai / total_chars_sem_shai)) if total_chars_sem_shai > 0 else 0
         
         embed = discord.Embed(
             title="🎭 Estatísticas das Classes - Guilda",
@@ -616,11 +1149,17 @@ async def estatisticas_classes(interaction: discord.Interaction):
             timestamp=discord.utils.utcnow()
         )
         
-        # Adicionar GS médio geral no topo
+        # Adicionar GS médio geral e sem Shai lado a lado
         embed.add_field(
             name="📊 GS Médio Geral",
             value=f"**{overall_avg_gs}** (todas as classes)",
-            inline=False
+            inline=True
+        )
+        
+        embed.add_field(
+            name="📊 GS Médio Sem Shai",
+            value=f"**{overall_avg_gs_sem_shai}** (excluindo Shai)",
+            inline=True
         )
         
         # Adicionar campos das classes individuais
@@ -640,6 +1179,253 @@ async def estatisticas_classes(interaction: discord.Interaction):
             f"❌ Erro ao buscar estatísticas: {str(e)}",
             ephemeral=True
         )
+
+@bot.tree.command(name="stats", description="[ADMIN] Mostra estatísticas completas de todos os membros")
+@app_commands.default_permissions(administrator=True)
+async def stats(interaction: discord.Interaction):
+    """Mostra lista completa de todos os membros com gearscore (apenas administradores)"""
+    if not interaction.user.guild_permissions.administrator:
+        await interaction.response.send_message(
+            "❌ Apenas administradores podem usar este comando!",
+            ephemeral=True
+        )
+        return
+    
+    try:
+        # Buscar apenas membros que têm o cargo da guilda
+        if not interaction.guild:
+            await interaction.response.send_message(
+                "❌ Este comando só pode ser usado em um servidor!",
+                ephemeral=True
+            )
+            return
+        
+        await interaction.response.defer(ephemeral=False)  # Não ephemeral para mostrar para todos
+        
+        valid_user_ids = await get_guild_member_ids(interaction.guild)
+        results = db.get_all_gearscores(valid_user_ids=valid_user_ids)
+        
+        if not results:
+            await interaction.followup.send(
+                "❌ Nenhum gearscore cadastrado ainda!",
+                ephemeral=True
+            )
+            return
+        
+        # Ordenar por gearscore total (MAX(AP, AAP) + DP) - do maior para o menor
+        def get_gs_from_result(result):
+            if isinstance(result, dict):
+                # MongoDB retorna como dict
+                ap = result.get('ap', 0)
+                aap = result.get('aap', 0)
+                dp = result.get('dp', 0)
+            else:
+                # SQLite/PostgreSQL: SELECT retorna tupla
+                # Ordem com character_name: id(0), user_id(1), family_name(2), character_name(3), class_pvp(4), ap(5), aap(6), dp(7), linkgear(8), updated_at(9)
+                # Ordem sem character_name: id(0), user_id(1), family_name(2), class_pvp(3), ap(4), aap(5), dp(6), linkgear(7), updated_at(8)
+                if len(result) >= 10:
+                    # Tem character_name
+                    ap = result[5] if len(result) > 5 else 0
+                    aap = result[6] if len(result) > 6 else 0
+                    dp = result[7] if len(result) > 7 else 0
+                else:
+                    # Não tem character_name (PostgreSQL antigo)
+                    ap = result[4] if len(result) > 4 else 0
+                    aap = result[5] if len(result) > 5 else 0
+                    dp = result[6] if len(result) > 6 else 0
+            
+            # Garantir que são inteiros
+            try:
+                ap = int(ap) if ap is not None else 0
+                aap = int(aap) if aap is not None else 0
+                dp = int(dp) if dp is not None else 0
+            except (ValueError, TypeError):
+                ap = 0
+                aap = 0
+                dp = 0
+            
+            return calculate_gs(ap, aap, dp)
+        
+        # Ordenar por GS (do maior para o menor)
+        sorted_results = sorted(results, key=get_gs_from_result, reverse=True)
+        
+        # Dividir em partes de 30 membros cada (similar às imagens)
+        members_per_page = 30
+        total_pages = (len(sorted_results) + members_per_page - 1) // members_per_page
+        
+        for page in range(total_pages):
+            start_idx = page * members_per_page
+            end_idx = min(start_idx + members_per_page, len(sorted_results))
+            page_results = sorted_results[start_idx:end_idx]
+            
+            embed = discord.Embed(
+                title=f"Membros (Geral) - Parte {page + 1}",
+                color=discord.Color.blue(),
+                timestamp=discord.utils.utcnow()
+            )
+            
+            # Criar lista de membros
+            members_list = []
+            for i, result in enumerate(page_results, start=start_idx + 1):
+                # Formatar dados dependendo do banco
+                if isinstance(result, dict):
+                    # MongoDB retorna como dict
+                    family_name = result.get('family_name', 'N/A')
+                    character_name = result.get('character_name', None)
+                    class_pvp = result.get('class_pvp', 'N/A')
+                    ap = result.get('ap', 0)
+                    aap = result.get('aap', 0)
+                    dp = result.get('dp', 0)
+                    linkgear = result.get('linkgear', 'N/A')
+                else:
+                    # SQLite/PostgreSQL: SELECT retorna tupla
+                    # Ordem: id(0), user_id(1), family_name(2), character_name(3), class_pvp(4), ap(5), aap(6), dp(7), linkgear(8), updated_at(9)
+                    # Mas PostgreSQL pode não ter character_name no SELECT, então verificar tamanho
+                    if len(result) >= 10:
+                        # Tem character_name
+                        family_name = result[2] if len(result) > 2 else 'N/A'
+                        character_name = result[3] if len(result) > 3 else None
+                        class_pvp = result[4] if len(result) > 4 else 'N/A'
+                        ap = result[5] if len(result) > 5 else 0
+                        aap = result[6] if len(result) > 6 else 0
+                        dp = result[7] if len(result) > 7 else 0
+                        linkgear_raw = result[8] if len(result) > 8 else 'N/A'
+                    else:
+                        # Não tem character_name (PostgreSQL antigo)
+                        family_name = result[2] if len(result) > 2 else 'N/A'
+                        character_name = None
+                        class_pvp = result[3] if len(result) > 3 else 'N/A'
+                        ap = result[4] if len(result) > 4 else 0
+                        aap = result[5] if len(result) > 5 else 0
+                        dp = result[6] if len(result) > 6 else 0
+                        linkgear_raw = result[7] if len(result) > 7 else 'N/A'
+                    
+                    # Se for datetime, significa que pegamos o campo errado, usar N/A
+                    if isinstance(linkgear_raw, datetime):
+                        linkgear = 'N/A'
+                    else:
+                        linkgear = linkgear_raw
+                
+                # Se character_name não foi definido, usar family_name
+                if character_name is None:
+                    character_name = family_name
+                
+                # Garantir que ap, aap, dp são inteiros
+                try:
+                    ap = int(ap) if ap is not None else 0
+                    aap = int(aap) if aap is not None else 0
+                    dp = int(dp) if dp is not None else 0
+                except (ValueError, TypeError):
+                    ap = 0
+                    aap = 0
+                    dp = 0
+                
+                gearscore_total = calculate_gs(ap, aap, dp)
+                
+                # Formatar link gear - garantir que é string e não datetime
+                if linkgear is None:
+                    linkgear_str = 'N/A'
+                elif isinstance(linkgear, datetime):
+                    # Se for datetime, significa que pegamos o campo errado, usar N/A
+                    linkgear_str = 'N/A'
+                else:
+                    linkgear_str = str(linkgear)
+                
+                if linkgear_str and linkgear_str != 'N/A' and linkgear_str != 'None' and linkgear_str.strip():
+                    # Verificar se é uma string válida antes de usar startswith
+                    linkgear_clean = linkgear_str.strip()
+                    if isinstance(linkgear_clean, str) and (linkgear_clean.startswith('http://') or linkgear_clean.startswith('https://')):
+                        # Link válido - criar markdown link do Discord
+                        link_text = f"([Link Gear]({linkgear_clean}))"
+                    elif isinstance(linkgear_clean, str) and linkgear_clean.strip():
+                        # Texto mas não é URL - tentar criar link mesmo assim (Discord pode não funcionar, mas mostra o texto)
+                        # Se não começa com http, adicionar https://
+                        if not linkgear_clean.startswith('http'):
+                            link_text = f"([Link Gear](https://{linkgear_clean}))"
+                        else:
+                            link_text = f"([Link Gear]({linkgear_clean}))"
+                    else:
+                        link_text = "(Link Gear)"
+                else:
+                    link_text = "(Link Gear)"
+                
+                # Formato: "1. Nome (Classe) - 861gs - (Link Gear)"
+                # Usar character_name se disponível, senão usar family_name
+                # Garantir que não está None ou vazio
+                if character_name and str(character_name).strip() and str(character_name) != 'N/A' and str(character_name) != 'None':
+                    display_name = str(character_name).strip()
+                elif family_name and str(family_name).strip() and str(family_name) != 'N/A':
+                    display_name = str(family_name).strip()
+                else:
+                    display_name = 'N/A'
+                
+                # Garantir que class_pvp não está vazio e é string
+                class_pvp_str = str(class_pvp).strip() if class_pvp and str(class_pvp) != 'N/A' else 'Desconhecida'
+                
+                # Debug: verificar se os valores estão corretos
+                # Se display_name parece ser um número, pode estar invertido
+                if display_name.isdigit() and class_pvp_str and not class_pvp_str.isdigit():
+                    # Parece estar invertido, trocar
+                    temp = display_name
+                    display_name = class_pvp_str
+                    class_pvp_str = temp
+                
+                member_line = f"{i}. {display_name} ({class_pvp_str}) - {gearscore_total}gs - {link_text}"
+                members_list.append(member_line)
+            
+            # Adicionar como campo de descrição (pode ter até 4096 caracteres)
+            description_text = "\n".join(members_list)
+            
+            # Se exceder o limite, dividir em chunks
+            max_length = 4096
+            if len(description_text) <= max_length:
+                embed.description = description_text
+            else:
+                # Dividir em múltiplos campos se necessário
+                current_chunk = []
+                current_length = 0
+                chunk_num = 1
+                
+                for member_line in members_list:
+                    line_length = len(member_line) + 1  # +1 para o \n
+                    if current_length + line_length > 1024:  # Limite por field
+                        embed.add_field(
+                            name=f"Lista {chunk_num}",
+                            value="\n".join(current_chunk),
+                            inline=False
+                        )
+                        current_chunk = [member_line]
+                        current_length = line_length
+                        chunk_num += 1
+                    else:
+                        current_chunk.append(member_line)
+                        current_length += line_length
+                
+                if current_chunk:
+                    embed.add_field(
+                        name=f"Lista {chunk_num}",
+                        value="\n".join(current_chunk),
+                        inline=False
+                    )
+            
+            embed.set_footer(text=f"Total: {len(sorted_results)} membros | Página {page + 1}/{total_pages}")
+            
+            if page == 0:
+                await interaction.followup.send(embed=embed)
+            else:
+                await interaction.channel.send(embed=embed)
+        
+    except Exception as e:
+        if interaction.response.is_done():
+            await interaction.followup.send(
+                f"❌ Erro ao buscar estatísticas: {str(e)}",
+                ephemeral=True
+            )
+        else:
+            await interaction.response.send_message(
+                f"❌ Erro ao buscar estatísticas: {str(e)}",
+                ephemeral=True
+            )
 
 @bot.tree.command(name="ranking_gearscore", description="[ADMIN] Mostra o ranking de gearscore")
 @app_commands.default_permissions(administrator=True)
@@ -1750,15 +2536,15 @@ async def admin_lista_classe(interaction: discord.Interaction, classe: str):
         for i, member in enumerate(members[:25], 1):
             if isinstance(member, dict):
                 family = member.get('family_name', 'N/A')
-                ap = member.get('ap', 0)
-                aap = member.get('aap', 0)
-                dp = member.get('dp', 0)
+                ap = int(member.get('ap', 0) or 0)
+                aap = int(member.get('aap', 0) or 0)
+                dp = int(member.get('dp', 0) or 0)
             else:
                 # SQLite/PostgreSQL: id, user_id, family_name, class_pvp, ap, aap, dp, linkgear, updated_at
                 family = member[2] if len(member) > 2 else 'N/A'
-                ap = member[4] if len(member) > 4 else 0
-                aap = member[5] if len(member) > 5 else 0
-                dp = member[6] if len(member) > 6 else 0
+                ap = int(member[4] or 0) if len(member) > 4 else 0
+                aap = int(member[5] or 0) if len(member) > 5 else 0
+                dp = int(member[6] or 0) if len(member) > 6 else 0
             
             total_gs = calculate_gs(ap, aap, dp)
             embed.add_field(
@@ -2076,14 +2862,14 @@ async def admin_progresso_player(interaction: discord.Interaction, usuario: disc
                 ephemeral=True
             )
 
-@bot.tree.command(name="admin_gs_medio_classe", description="[ADMIN] Mostra GS médio detalhado de uma classe")
+@bot.tree.command(name="analise_classe", description="[ADMIN] Análise completa de uma classe com relatório detalhado de todos os membros")
 @app_commands.describe(
     classe="Classe a ser analisada (digite para buscar)"
 )
 @app_commands.autocomplete(classe=classe_autocomplete)
 @app_commands.default_permissions(administrator=True)
-async def admin_gs_medio_classe(interaction: discord.Interaction, classe: str):
-    """Mostra GS médio detalhado de uma classe (apenas administradores)"""
+async def analise_classe(interaction: discord.Interaction, classe: str):
+    """Análise completa de uma classe com relatório detalhado de todos os membros (apenas administradores)"""
     if not interaction.user.guild_permissions.administrator:
         await interaction.response.send_message(
             "❌ Apenas administradores podem usar este comando!",
@@ -2121,13 +2907,14 @@ async def admin_gs_medio_classe(interaction: discord.Interaction, classe: str):
         
         for member in members:
             if isinstance(member, dict):
-                ap = member.get('ap', 0)
-                aap = member.get('aap', 0)
-                dp = member.get('dp', 0)
+                ap = int(member.get('ap', 0) or 0)
+                aap = int(member.get('aap', 0) or 0)
+                dp = int(member.get('dp', 0) or 0)
             else:
-                ap = member[5] if len(member) > 5 else 0
-                aap = member[6] if len(member) > 6 else 0
-                dp = member[7] if len(member) > 7 else 0
+                # SQLite/PostgreSQL: id, user_id, family_name, class_pvp, ap, aap, dp, linkgear, updated_at
+                ap = int(member[4] or 0) if len(member) > 4 else 0
+                aap = int(member[5] or 0) if len(member) > 5 else 0
+                dp = int(member[6] or 0) if len(member) > 6 else 0
             
             total_ap += ap
             total_aap += aap
@@ -2160,16 +2947,16 @@ async def admin_gs_medio_classe(interaction: discord.Interaction, classe: str):
         for i, member in enumerate(top_5, 1):
             if isinstance(member, dict):
                 family_name = member.get('family_name', 'N/A')
-                ap = member.get('ap', 0)
-                aap = member.get('aap', 0)
-                dp = member.get('dp', 0)
+                ap = int(member.get('ap', 0) or 0)
+                aap = int(member.get('aap', 0) or 0)
+                dp = int(member.get('dp', 0) or 0)
                 gs = calculate_gs(ap, aap, dp)
             else:
                 # SQLite/PostgreSQL: id, user_id, family_name, class_pvp, ap, aap, dp, linkgear, updated_at
                 family_name = member[2] if len(member) > 2 else 'N/A'
-                ap = member[4] if len(member) > 4 else 0
-                aap = member[5] if len(member) > 5 else 0
-                dp = member[6] if len(member) > 6 else 0
+                ap = int(member[4] or 0) if len(member) > 4 else 0
+                aap = int(member[5] or 0) if len(member) > 5 else 0
+                dp = int(member[6] or 0) if len(member) > 6 else 0
                 gs = calculate_gs(ap, aap, dp)
             
             medal = "🥇" if i == 1 else "🥈" if i == 2 else "🥉" if i == 3 else f"#{i}"
@@ -2179,6 +2966,87 @@ async def admin_gs_medio_classe(interaction: discord.Interaction, classe: str):
             embed.add_field(name="🏆 Top 5 da Classe", value=top_text, inline=False)
         
         await interaction.followup.send(embed=embed, ephemeral=True)
+        
+        # Criar relatório completo de todos os membros
+        # Ordenar membros por GS (maior para menor)
+        def get_gs_from_member(member):
+            if isinstance(member, dict):
+                ap = int(member.get('ap', 0) or 0)
+                aap = int(member.get('aap', 0) or 0)
+                dp = int(member.get('dp', 0) or 0)
+            else:
+                ap = int(member[4] or 0) if len(member) > 4 else 0
+                aap = int(member[5] or 0) if len(member) > 5 else 0
+                dp = int(member[6] or 0) if len(member) > 6 else 0
+            return calculate_gs(ap, aap, dp)
+        
+        sorted_members = sorted(members, key=get_gs_from_member, reverse=True)
+        
+        # Criar embeds com relatório completo
+        # Dividir em múltiplos embeds se necessário (limite de 25 campos por embed)
+        members_per_embed = 20  # Deixar margem para não exceder 25 campos
+        
+        for embed_idx in range(0, len(sorted_members), members_per_embed):
+            report_embed = discord.Embed(
+                title=f"📋 Relatório Completo - {classe}",
+                description=f"Lista detalhada de todos os membros (ordenado por GS)",
+                color=discord.Color.blue(),
+                timestamp=discord.utils.utcnow()
+            )
+            
+            if embed_idx == 0:
+                report_embed.add_field(
+                    name="📊 Resumo",
+                    value=f"**Total de membros:** {len(sorted_members)}\n"
+                          f"**GS Médio:** {avg_gs}\n"
+                          f"**AP Médio:** {avg_ap} | **AAP Médio:** {avg_aap} | **DP Médio:** {avg_dp}",
+                    inline=False
+                )
+            
+            # Adicionar membros deste embed
+            chunk_members = sorted_members[embed_idx:embed_idx + members_per_embed]
+            
+            for i, member in enumerate(chunk_members, 1):
+                # Formatar dados dependendo do banco
+                if isinstance(member, dict):
+                    family_name = member.get('family_name', 'N/A')
+                    ap = int(member.get('ap', 0) or 0)
+                    aap = int(member.get('aap', 0) or 0)
+                    dp = int(member.get('dp', 0) or 0)
+                    linkgear = member.get('linkgear', 'N/A')
+                else:
+                    # SQLite/PostgreSQL: id, user_id, family_name, class_pvp, ap, aap, dp, linkgear, updated_at
+                    family_name = member[2] if len(member) > 2 else 'N/A'
+                    ap = int(member[4] or 0) if len(member) > 4 else 0
+                    aap = int(member[5] or 0) if len(member) > 5 else 0
+                    dp = int(member[6] or 0) if len(member) > 6 else 0
+                    linkgear = member[7] if len(member) > 7 else 'N/A'
+                
+                gs_total = calculate_gs(ap, aap, dp)
+                position = embed_idx + i
+                
+                # Criar texto do membro
+                member_info = f"**GS:** {gs_total}\n"
+                member_info += f"⚔️ AP: {ap} | 🔥 AAP: {aap} | 🛡️ DP: {dp}\n"
+                member_info += f"🔗 **Link Gear:** {linkgear}"
+                
+                # Adicionar campo (limite de 25 campos por embed do Discord)
+                if len(report_embed.fields) < 25:
+                    report_embed.add_field(
+                        name=f"#{position} - {family_name}",
+                        value=member_info,
+                        inline=False
+                    )
+            
+            # Adicionar footer com informações de paginação
+            if len(sorted_members) > members_per_embed:
+                total_pages = (len(sorted_members) + members_per_embed - 1) // members_per_embed
+                current_page = (embed_idx // members_per_embed) + 1
+                report_embed.set_footer(text=f"Página {current_page} de {total_pages} | Total: {len(sorted_members)} membros")
+            else:
+                report_embed.set_footer(text=f"Total: {len(sorted_members)} membros")
+            
+            await interaction.followup.send(embed=report_embed, ephemeral=True)
         
     except Exception as e:
         # Verificar se já respondeu
