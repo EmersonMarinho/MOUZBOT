@@ -1,0 +1,32 @@
+# Token do bot Discord
+# Obtenha o token em: https://discord.com/developers/applications
+DISCORD_TOKEN=seu_token_do_bot_aqui
+
+# ============================================
+# CONFIGURAÇÃO DO BANCO DE DADOS
+# Escolha UMA das opções abaixo:
+# ============================================
+
+# OPÇÃO 1: PostgreSQL (Supabase, Railway, Neon)
+# Formato: postgresql://user:password@host:port/database
+# Exemplo Neon Tech:
+# DATABASE_URL=postgresql:
+# DATABASE_URL=postgresql://user:password@host:port/database
+
+# OPÇÃO 2: MongoDB Atlas
+# Formato: mongodb+srv://user:password@cluster.mongodb.net/
+# MONGODB_URI=mongodb+srv://user:password@cluster.mongodb.net/
+# MONGODB_DB_NAME=bdo_gearscore
+
+# OPÇÃO 3: SQLite (local - padrão, não precisa configurar nada)
+# O banco será criado automaticamente como bdo_gearscore.db
+
+# ============================================
+# CONFIGURAÇÃO DE PERMISSÕES PARA DM EM MASSA
+# ============================================
+# IDs dos cargos que podem usar comandos de DM em massa (separados por vírgula)
+# Exemplo: ALLOWED_DM_ROLES=123456789012345678,987654321098765432
+# Deixe vazio ou não configure para permitir apenas administradores
+# Para obter o ID de um cargo: Ative o Modo Desenvolvedor no Discord e clique com botão direito no cargo > Copiar ID
+# ALLOWED_DM_ROLES=123456789012345678,987654321098765432
+
