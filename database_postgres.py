@@ -313,56 +313,112 @@ class Database:
         conn.close()
         return result[0] if result else None
     
-    def get_all_gearscores(self):
-        """Busca todos os gearscores"""
+    def get_all_gearscores(self, valid_user_ids=None):
+        """
+        Busca todos os gearscores
+        
+        Args:
+            valid_user_ids: Set ou lista de user_ids válidos (que têm o cargo da guilda).
+                           Se None, retorna todos os registros.
+        """
         conn = self.get_connection()
         cursor = conn.cursor()
         
-        cursor.execute('''
-            SELECT id, user_id, family_name, class_pvp, ap, aap, dp, linkgear, updated_at
-            FROM gearscore 
-            ORDER BY updated_at DESC
-        ''')
+        if valid_user_ids:
+            placeholders = ','.join(['%s'] * len(valid_user_ids))
+            query = f'''
+                SELECT id, user_id, family_name, class_pvp, ap, aap, dp, linkgear, updated_at
+                FROM gearscore 
+                WHERE user_id IN ({placeholders})
+                ORDER BY updated_at DESC
+            '''
+            cursor.execute(query, list(valid_user_ids))
+        else:
+            cursor.execute('''
+                SELECT id, user_id, family_name, class_pvp, ap, aap, dp, linkgear, updated_at
+                FROM gearscore 
+                ORDER BY updated_at DESC
+            ''')
         
         result = cursor.fetchall()
         cursor.close()
         conn.close()
         return result
     
-    def get_class_statistics(self):
-        """Retorna estatísticas por classe"""
+    def get_class_statistics(self, valid_user_ids=None):
+        """
+        Retorna estatísticas por classe
+        
+        Args:
+            valid_user_ids: Set ou lista de user_ids válidos (que têm o cargo da guilda).
+                           Se None, retorna todos os registros.
+        """
         conn = self.get_connection()
         cursor = conn.cursor()
         
-        cursor.execute('''
-            SELECT 
-                class_pvp,
-                COUNT(*) as total,
-                AVG(GREATEST(ap, aap) + dp) as avg_gs,
-                AVG(ap) as avg_ap,
-                AVG(aap) as avg_aap,
-                AVG(dp) as avg_dp
-            FROM gearscore
-            GROUP BY class_pvp
-            ORDER BY total DESC, avg_gs DESC
-        ''')
+        if valid_user_ids:
+            placeholders = ','.join(['%s'] * len(valid_user_ids))
+            query = f'''
+                SELECT 
+                    class_pvp,
+                    COUNT(*) as total,
+                    AVG(GREATEST(ap, aap) + dp) as avg_gs,
+                    AVG(ap) as avg_ap,
+                    AVG(aap) as avg_aap,
+                    AVG(dp) as avg_dp
+                FROM gearscore
+                WHERE user_id IN ({placeholders})
+                GROUP BY class_pvp
+                ORDER BY total DESC, avg_gs DESC
+            '''
+            cursor.execute(query, list(valid_user_ids))
+        else:
+            cursor.execute('''
+                SELECT 
+                    class_pvp,
+                    COUNT(*) as total,
+                    AVG(GREATEST(ap, aap) + dp) as avg_gs,
+                    AVG(ap) as avg_ap,
+                    AVG(aap) as avg_aap,
+                    AVG(dp) as avg_dp
+                FROM gearscore
+                GROUP BY class_pvp
+                ORDER BY total DESC, avg_gs DESC
+            ''')
         
         result = cursor.fetchall()
         cursor.close()
         conn.close()
         return result
     
-    def get_class_members(self, class_pvp):
-        """Retorna todos os membros de uma classe específica"""
+    def get_class_members(self, class_pvp, valid_user_ids=None):
+        """
+        Retorna todos os membros de uma classe específica
+        
+        Args:
+            class_pvp: Nome da classe
+            valid_user_ids: Set ou lista de user_ids válidos (que têm o cargo da guilda).
+                           Se None, retorna todos os registros.
+        """
         conn = self.get_connection()
         cursor = conn.cursor()
         
-        cursor.execute('''
-            SELECT id, user_id, family_name, class_pvp, ap, aap, dp, linkgear, updated_at
-            FROM gearscore 
-            WHERE class_pvp = %s
-            ORDER BY (GREATEST(ap, aap) + dp) DESC
-        ''', (class_pvp,))
+        if valid_user_ids:
+            placeholders = ','.join(['%s'] * len(valid_user_ids))
+            query = f'''
+                SELECT id, user_id, family_name, class_pvp, ap, aap, dp, linkgear, updated_at
+                FROM gearscore 
+                WHERE class_pvp = %s AND user_id IN ({placeholders})
+                ORDER BY (GREATEST(ap, aap) + dp) DESC
+            '''
+            cursor.execute(query, [class_pvp] + list(valid_user_ids))
+        else:
+            cursor.execute('''
+                SELECT id, user_id, family_name, class_pvp, ap, aap, dp, linkgear, updated_at
+                FROM gearscore 
+                WHERE class_pvp = %s
+                ORDER BY (GREATEST(ap, aap) + dp) DESC
+            ''', (class_pvp,))
         
         result = cursor.fetchall()
         cursor.close()

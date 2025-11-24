@@ -46,7 +46,8 @@ class Database:
             "aap": aap,
             "dp": dp,
             "linkgear": linkgear,
-            "updated_at": datetime.utcnow()
+            "updated_at": datetime.utcnow(),
+            "is_active": 1
         }
         
         self.collection.insert_one(document)
@@ -94,6 +95,12 @@ class Database:
             "linkgear": linkgear,
             "updated_at": datetime.utcnow()
         }
+        # Manter is_active se já existir, senão definir como 1
+        existing = self.collection.find_one({"user_id": user_id, "class_pvp": class_pvp})
+        if existing and "is_active" in existing:
+            document["is_active"] = existing["is_active"]
+        else:
+            document["is_active"] = 1
         
         self.collection.update_one(
             {"user_id": user_id, "class_pvp": class_pvp},
@@ -133,14 +140,38 @@ class Database:
         result = self.collection.find_one({"user_id": user_id})
         return result.get("class_pvp") if result else None
     
-    def get_all_gearscores(self):
-        """Busca todos os gearscores"""
-        results = list(self.collection.find().sort("updated_at", -1))
+    def get_all_gearscores(self, valid_user_ids=None):
+        """
+        Busca todos os gearscores
+        
+        Args:
+            valid_user_ids: Set ou lista de user_ids válidos (que têm o cargo da guilda).
+                           Se None, retorna todos os registros.
+        """
+        query = {}
+        if valid_user_ids:
+            query = {"user_id": {"$in": list(valid_user_ids)}}
+        
+        results = list(self.collection.find(query).sort("updated_at", -1))
         return results
     
-    def get_class_statistics(self):
-        """Retorna estatísticas por classe"""
-        pipeline = [
+    def get_class_statistics(self, valid_user_ids=None):
+        """
+        Retorna estatísticas por classe
+        
+        Args:
+            valid_user_ids: Set ou lista de user_ids válidos (que têm o cargo da guilda).
+                           Se None, retorna todos os registros.
+        """
+        pipeline = []
+        
+        # Adicionar filtro de user_ids se fornecido
+        if valid_user_ids:
+            pipeline.append({
+                "$match": {"user_id": {"$in": list(valid_user_ids)}}
+            })
+        
+        pipeline.extend([
             {
                 "$addFields": {
                     "gs": {
@@ -173,15 +204,28 @@ class Database:
                 }
             },
             {"$sort": {"total": -1, "avg_gs": -1}}
-        ]
+        ])
+        
         results = list(self.collection.aggregate(pipeline))
         return results
     
-    def get_class_members(self, class_pvp):
-        """Retorna todos os membros de uma classe específica"""
+    def get_class_members(self, class_pvp, valid_user_ids=None):
+        """
+        Retorna todos os membros de uma classe específica
+        
+        Args:
+            class_pvp: Nome da classe
+            valid_user_ids: Set ou lista de user_ids válidos (que têm o cargo da guilda).
+                           Se None, retorna todos os registros.
+        """
         # Ordenar por GS (MAX(AP, AAP) + DP)
+        match_conditions = {"class_pvp": class_pvp}
+        
+        if valid_user_ids:
+            match_conditions["user_id"] = {"$in": list(valid_user_ids)}
+        
         pipeline = [
-            {"$match": {"class_pvp": class_pvp}},
+            {"$match": match_conditions},
             {
                 "$addFields": {
                     "gs": {

@@ -2,7 +2,7 @@ import discord
 from discord import app_commands
 from discord.ext import commands
 import os
-from config import DISCORD_TOKEN, BDO_CLASSES, DATABASE_NAME, DATABASE_URL, ALLOWED_DM_ROLES, NOTIFICATION_CHANNEL_ID
+from config import DISCORD_TOKEN, BDO_CLASSES, DATABASE_NAME, DATABASE_URL, ALLOWED_DM_ROLES, NOTIFICATION_CHANNEL_ID, GUILD_MEMBER_ROLE_ID
 # Importar o banco de dados apropriado
 if DATABASE_URL:
     from database_postgres import Database
@@ -35,6 +35,30 @@ db = Database()
 def calculate_gs(ap, aap, dp):
     """Calcula o Gearscore: maior entre AP ou AAP + DP"""
     return max(ap, aap) + dp
+
+# Função helper para verificar se um membro tem o cargo da guilda
+def has_guild_role(member: discord.Member) -> bool:
+    """Verifica se o membro tem o cargo que indica participação na guilda"""
+    if not member or not member.guild:
+        return False
+    return any(role.id == GUILD_MEMBER_ROLE_ID for role in member.roles)
+
+# Função helper para obter todos os user_ids que têm o cargo da guilda
+async def get_guild_member_ids(guild: discord.Guild) -> set:
+    """Retorna um set com todos os IDs de usuários que têm o cargo da guilda"""
+    member_ids = set()
+    if not guild:
+        return member_ids
+    
+    role = guild.get_role(GUILD_MEMBER_ROLE_ID)
+    if not role:
+        return member_ids
+    
+    for member in guild.members:
+        if has_guild_role(member):
+            member_ids.add(str(member.id))
+    
+    return member_ids
 
 # Função helper para enviar notificação ao canal
 async def send_notification_to_channel(bot, interaction, action_type, nome_familia, classe_pvp, ap, aap, dp, linkgear):
@@ -187,9 +211,18 @@ async def registro(
     try:
         user_id = str(interaction.user.id)
         
+        # Verificar se é em um servidor (não DM)
+        if not interaction.guild:
+            await interaction.response.send_message(
+                "❌ Este comando só pode ser usado em um servidor!",
+                ephemeral=True
+            )
+            return
+        
         # Deferir resposta se a operação pode demorar (privado)
         await interaction.response.defer(ephemeral=True)
         
+        # Registrar gearscore
         db.register_gearscore(
             user_id=user_id,
             family_name=nome_familia,
@@ -199,6 +232,27 @@ async def registro(
             dp=dp,
             linkgear=linkgear
         )
+        
+        # Adicionar cargo da guilda ao membro
+        member = interaction.guild.get_member(interaction.user.id)
+        role_added = False
+        role_error = None
+        
+        if member:
+            role = interaction.guild.get_role(GUILD_MEMBER_ROLE_ID)
+            if role:
+                try:
+                    if not has_guild_role(member):
+                        await member.add_roles(role, reason="Registro de gearscore - membro da guilda")
+                        role_added = True
+                except discord.Forbidden:
+                    role_error = "Sem permissão para adicionar cargo"
+                except discord.HTTPException as e:
+                    role_error = f"Erro ao adicionar cargo: {str(e)}"
+            else:
+                role_error = "Cargo da guilda não encontrado no servidor"
+        else:
+            role_error = "Membro não encontrado no servidor"
         
         # Calcular GS total (MAX(AP, AAP) + DP)
         gs_total = calculate_gs(ap, aap, dp)
@@ -215,6 +269,12 @@ async def registro(
         embed.add_field(name="🛡️ DP", value=f"{dp}", inline=True)
         embed.add_field(name="📊 GS Total", value=f"**{gs_total}** (MAX({ap}, {aap}) + {dp})", inline=False)
         embed.add_field(name="🔗 Link Gear", value=linkgear, inline=False)
+        
+        if role_added:
+            embed.add_field(name="🎖️ Cargo", value="Cargo da guilda atribuído com sucesso!", inline=False)
+        elif role_error:
+            embed.add_field(name="⚠️ Aviso", value=f"Não foi possível adicionar o cargo: {role_error}", inline=False)
+        
         embed.set_footer(text=f"Registrado por {interaction.user.display_name}")
         
         await interaction.followup.send(embed=embed, ephemeral=True)
@@ -434,7 +494,17 @@ async def classes_bdo(interaction: discord.Interaction):
         )
         return
     try:
-        stats = db.get_class_statistics()
+        # Buscar apenas membros que têm o cargo da guilda
+        valid_user_ids = await get_guild_member_ids(interaction.guild)
+        
+        if not valid_user_ids:
+            await interaction.response.send_message(
+                "❌ Nenhum membro com o cargo da guilda encontrado!",
+                ephemeral=True
+            )
+            return
+        
+        stats = db.get_class_statistics(valid_user_ids=valid_user_ids)
         
         if not stats:
             await interaction.response.send_message(
@@ -443,16 +513,13 @@ async def classes_bdo(interaction: discord.Interaction):
             )
             return
         
-        embed = discord.Embed(
-            title="🎭 Estatísticas das Classes - Guilda",
-            description="Distribuição e GS médio por classe",
-            color=discord.Color.purple(),
-            timestamp=discord.utils.utcnow()
-        )
-        
+        # Calcular GS médio geral
         total_chars = 0
+        total_weighted_gs = 0
+        stats_list = []
+        
         for stat in stats:
-            # Formatar dados dependendo do banco (SQLite retorna tupla, PostgreSQL retorna tupla, MongoDB retorna dict)
+            # Formatar dados dependendo do banco
             if isinstance(stat, dict):
                 class_name = stat.get('class_pvp', 'Desconhecida')
                 total = stat.get('total', 0)
@@ -463,6 +530,28 @@ async def classes_bdo(interaction: discord.Interaction):
                 avg_gs = float(stat[2]) if len(stat) > 2 and stat[2] is not None else 0
             
             total_chars += total
+            total_weighted_gs += avg_gs * total
+            stats_list.append((class_name, total, avg_gs))
+        
+        # Calcular GS médio geral (média ponderada)
+        overall_avg_gs = int(round(total_weighted_gs / total_chars)) if total_chars > 0 else 0
+        
+        embed = discord.Embed(
+            title="🎭 Estatísticas das Classes - Guilda",
+            description="Distribuição e GS médio por classe",
+            color=discord.Color.purple(),
+            timestamp=discord.utils.utcnow()
+        )
+        
+        # Adicionar GS médio geral no topo
+        embed.add_field(
+            name="📊 GS Médio Geral",
+            value=f"**{overall_avg_gs}** (todas as classes)",
+            inline=False
+        )
+        
+        # Adicionar campos das classes individuais
+        for class_name, total, avg_gs in stats_list:
             avg_gs_int = int(round(avg_gs)) if avg_gs else 0
             embed.add_field(
                 name=f"{class_name}",
@@ -470,7 +559,7 @@ async def classes_bdo(interaction: discord.Interaction):
                 inline=True
             )
         
-        embed.set_footer(text=f"Total de {total_chars} personagens cadastrados")
+        embed.set_footer(text=f"Total de {total_chars} personagens cadastrados (apenas membros com cargo da guilda)")
         await interaction.response.send_message(embed=embed)
         
     except Exception as e:
@@ -482,7 +571,16 @@ async def classes_bdo(interaction: discord.Interaction):
 @bot.tree.command(name="ranking_gearscore", description="Mostra o ranking de gearscore")
 async def ranking_gearscore(interaction: discord.Interaction):
     try:
-        results = db.get_all_gearscores()
+        # Buscar apenas membros que têm o cargo da guilda
+        if not interaction.guild:
+            await interaction.response.send_message(
+                "❌ Este comando só pode ser usado em um servidor!",
+                ephemeral=True
+            )
+            return
+        
+        valid_user_ids = await get_guild_member_ids(interaction.guild)
+        results = db.get_all_gearscores(valid_user_ids=valid_user_ids)
         
         if not results:
             await interaction.response.send_message(
@@ -492,7 +590,19 @@ async def ranking_gearscore(interaction: discord.Interaction):
             return
         
         # Ordenar por gearscore total (MAX(AP, AAP) + DP)
-        sorted_results = sorted(results, key=lambda x: calculate_gs(x[4], x[5], x[6]), reverse=True)
+        # Formatar dados dependendo do banco
+        def get_gs_from_result(result):
+            if isinstance(result, dict):
+                ap = result.get('ap', 0)
+                aap = result.get('aap', 0)
+                dp = result.get('dp', 0)
+            else:
+                ap = result[4] if len(result) > 4 else 0
+                aap = result[5] if len(result) > 5 else 0
+                dp = result[6] if len(result) > 6 else 0
+            return calculate_gs(ap, aap, dp)
+        
+        sorted_results = sorted(results, key=get_gs_from_result, reverse=True)
         
         embed = discord.Embed(
             title="🏆 Ranking de Gearscore",
@@ -501,14 +611,29 @@ async def ranking_gearscore(interaction: discord.Interaction):
         )
         
         for i, result in enumerate(sorted_results[:10], 1):  # Top 10
-            gearscore_total = calculate_gs(result[4], result[5], result[6])
-            info = f"**{result[1]}** - {result[2]}\n"
-            info += f"Classe: {result[3]}\n"
-            info += f"AP: {result[4]} | AAP: {result[5]} | DP: {result[6]}\n"
+            # Formatar dados dependendo do banco
+            if isinstance(result, dict):
+                family_name = result.get('family_name', 'N/A')
+                class_pvp = result.get('class_pvp', 'N/A')
+                ap = result.get('ap', 0)
+                aap = result.get('aap', 0)
+                dp = result.get('dp', 0)
+            else:
+                # SQLite/PostgreSQL: id, user_id, family_name, class_pvp, ap, aap, dp, linkgear, updated_at
+                family_name = result[2] if len(result) > 2 else 'N/A'
+                class_pvp = result[3] if len(result) > 3 else 'N/A'
+                ap = result[4] if len(result) > 4 else 0
+                aap = result[5] if len(result) > 5 else 0
+                dp = result[6] if len(result) > 6 else 0
+            
+            gearscore_total = calculate_gs(ap, aap, dp)
+            info = f"**{family_name}**\n"
+            info += f"Classe: {class_pvp}\n"
+            info += f"AP: {ap} | AAP: {aap} | DP: {dp}\n"
             info += f"**Total: {gearscore_total}**"
             
             medal = "🥇" if i == 1 else "🥈" if i == 2 else "🥉" if i == 3 else f"#{i}"
-            embed.add_field(name=f"{medal} {result[2]}", value=info, inline=False)
+            embed.add_field(name=f"{medal} {family_name}", value=info, inline=False)
         
         await interaction.response.send_message(embed=embed)
         
@@ -802,11 +927,13 @@ async def admin_lista_classe(interaction: discord.Interaction, classe: str):
         # Deferir resposta antes de operações que podem demorar
         await interaction.response.defer(ephemeral=True)
         
-        members = db.get_class_members(classe)
+        # Buscar apenas membros que têm o cargo da guilda
+        valid_user_ids = await get_guild_member_ids(interaction.guild)
+        members = db.get_class_members(classe, valid_user_ids=valid_user_ids)
         
         if not members:
             await interaction.followup.send(
-                f"❌ Nenhum membro encontrado com a classe {classe}",
+                f"❌ Nenhum membro encontrado com a classe {classe} (apenas membros com cargo da guilda)",
                 ephemeral=True
             )
             return
@@ -1174,11 +1301,13 @@ async def admin_gs_medio_classe(interaction: discord.Interaction, classe: str):
         # Deferir resposta antes de operações que podem demorar
         await interaction.response.defer(ephemeral=True)
         
-        members = db.get_class_members(classe)
+        # Buscar apenas membros que têm o cargo da guilda
+        valid_user_ids = await get_guild_member_ids(interaction.guild)
+        members = db.get_class_members(classe, valid_user_ids=valid_user_ids)
         
         if not members:
             await interaction.followup.send(
-                f"❌ Nenhum membro encontrado com a classe {classe}",
+                f"❌ Nenhum membro encontrado com a classe {classe} (apenas membros com cargo da guilda)",
                 ephemeral=True
             )
             return
