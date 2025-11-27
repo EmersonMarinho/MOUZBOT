@@ -39,6 +39,16 @@ MOVE_LOG_CHANNEL_ID = 1442371565022089237
 # ID do cargo que indica que o player faz parte da guilda (MOUZ/MANIFEST)
 GUILD_MEMBER_ROLE_ID = 1412255708967207012
 
+# ID do cargo "Registrado" - dado quando o player faz registro de gearscore
+REGISTERED_ROLE_ID = 1442888990997876817
+
+# ID do cargo "Não Registrado" - dado a membros da guilda que ainda não fizeram registro
+UNREGISTERED_ROLE_ID = 1442889439717359728
+
+# Configurações de lembrete automático de atualização de GS
+GS_UPDATE_REMINDER_DAYS = 10  # Dias sem atualizar para enviar lembrete
+GS_REMINDER_CHECK_HOUR = 12  # Hora do dia para verificar (12 = meio-dia)
+
 # Lista de classes do Black Desert Online
 BDO_CLASSES = [
     "Warrior",

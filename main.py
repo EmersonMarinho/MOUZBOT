@@ -1,11 +1,13 @@
 import discord
 from discord import app_commands
-from discord.ext import commands
+from discord.ext import commands, tasks
 import os
 import io
+import logging
 from datetime import datetime
 from pytz import timezone
-from config import DISCORD_TOKEN, BDO_CLASSES, DATABASE_NAME, DATABASE_URL, ALLOWED_DM_ROLES, NOTIFICATION_CHANNEL_ID, GUILD_MEMBER_ROLE_ID, DM_REPORT_CHANNEL_ID, LIST_CHANNEL_ID, MOVE_LOG_CHANNEL_ID
+from config import DISCORD_TOKEN, BDO_CLASSES, DATABASE_NAME, DATABASE_URL, ALLOWED_DM_ROLES, NOTIFICATION_CHANNEL_ID, GUILD_MEMBER_ROLE_ID, DM_REPORT_CHANNEL_ID, LIST_CHANNEL_ID, MOVE_LOG_CHANNEL_ID, REGISTERED_ROLE_ID, UNREGISTERED_ROLE_ID, GS_UPDATE_REMINDER_DAYS, GS_REMINDER_CHECK_HOUR
+from datetime import timedelta
 # Importar o banco de dados apropriado
 if DATABASE_URL:
     from database_postgres import Database
@@ -31,8 +33,17 @@ def has_dm_permission(member: discord.Member) -> bool:
     # Por padrão, se não houver lista, apenas administradores podem usar
     return member.guild_permissions.administrator
 
+# Configurar sistema de logging
+logging.basicConfig(
+    level=logging.INFO,
+    format='%(asctime)s | %(levelname)s | %(message)s',
+    datefmt='%Y-%m-%d %H:%M:%S'
+)
+logger = logging.getLogger(__name__)
+
 # Inicializar banco de dados
 db = Database()
+logger.info("Banco de dados inicializado")
 
 # Função helper para calcular GS corretamente (MAX(AP, AAP) + DP)
 def calculate_gs(ap, aap, dp):
@@ -62,6 +73,220 @@ async def get_guild_member_ids(guild: discord.Guild) -> set:
             member_ids.add(str(member.id))
     
     return member_ids
+
+# Função helper para gerenciar cargos de registro
+async def update_registration_roles(member: discord.Member, has_registration: bool):
+    """Atualiza os cargos de registro do membro baseado no status de registro"""
+    if not member or not member.guild:
+        return
+    
+    registered_role = member.guild.get_role(REGISTERED_ROLE_ID)
+    unregistered_role = member.guild.get_role(UNREGISTERED_ROLE_ID)
+    
+    try:
+        if has_registration:
+            # Tem registro: dar cargo "Registrado" e remover "Não Registrado"
+            if registered_role and registered_role not in member.roles:
+                await member.add_roles(registered_role, reason="Registro de gearscore")
+            if unregistered_role and unregistered_role in member.roles:
+                await member.remove_roles(unregistered_role, reason="Registro de gearscore realizado")
+        else:
+            # Não tem registro: remover "Registrado" e dar "Não Registrado" (se tiver cargo membro)
+            if registered_role and registered_role in member.roles:
+                await member.remove_roles(registered_role, reason="Sem registro de gearscore")
+            if unregistered_role and has_guild_role(member) and unregistered_role not in member.roles:
+                await member.add_roles(unregistered_role, reason="Membro da guilda sem registro")
+    except discord.Forbidden:
+        logger.warning(f"Sem permissão para gerenciar cargos de {member.display_name} (ID: {member.id})")
+    except discord.HTTPException as e:
+        logger.error(f"Erro ao gerenciar cargos de {member.display_name} (ID: {member.id}): {e}")
+
+# Função helper para verificar e atualizar cargos de todos os membros da guilda
+async def sync_registration_roles(guild: discord.Guild):
+    """Sincroniza os cargos de registro de todos os membros da guilda"""
+    if not guild:
+        return
+    
+    # Buscar todos os membros com cargo da guilda
+    guild_member_ids = await get_guild_member_ids(guild)
+    
+    # Buscar todos os registros do banco
+    all_registered = db.get_all_gearscores(valid_user_ids=guild_member_ids)
+    registered_user_ids = set()
+    
+    for record in all_registered:
+        if isinstance(record, dict):
+            user_id = record.get('user_id', '')
+        else:
+            user_id = record[1] if len(record) > 1 else ''
+        if user_id:
+            registered_user_ids.add(str(user_id))
+    
+    # Atualizar cargos de cada membro
+    for user_id in guild_member_ids:
+        member = guild.get_member(int(user_id))
+        if member:
+            has_registration = user_id in registered_user_ids
+            await update_registration_roles(member, has_registration)
+
+# Função helper para verificar e enviar lembretes de atualização de GS
+async def check_gs_update_reminders(guild: discord.Guild):
+    """Verifica membros que não atualizaram GS nos últimos X dias e envia lembrete"""
+    if not guild:
+        return
+    
+    # Buscar todos os membros com cargo da guilda
+    guild_member_ids = await get_guild_member_ids(guild)
+    
+    if not guild_member_ids:
+        return
+    
+    # Buscar todos os registros do banco
+    all_registered = db.get_all_gearscores(valid_user_ids=guild_member_ids)
+    
+    # Data limite para considerar desatualizado
+    now = datetime.now()
+    limit_date = now - timedelta(days=GS_UPDATE_REMINDER_DAYS)
+    
+    reminders_sent = 0
+    errors = 0
+    
+    for record in all_registered:
+        try:
+            # Extrair dados do registro
+            if isinstance(record, dict):
+                user_id = record.get('user_id', '')
+                family_name = record.get('family_name', 'N/A')
+                class_pvp = record.get('class_pvp', 'N/A')
+                ap = record.get('ap', 0)
+                aap = record.get('aap', 0)
+                dp = record.get('dp', 0)
+                updated_at = record.get('updated_at')
+            else:
+                user_id = str(record[1]) if len(record) > 1 else ''
+                family_name = record[2] if len(record) > 2 else 'N/A'
+                class_pvp = record[3] if len(record) > 3 else 'N/A'
+                ap = record[4] if len(record) > 4 else 0
+                aap = record[5] if len(record) > 5 else 0
+                dp = record[6] if len(record) > 6 else 0
+                updated_at = record[8] if len(record) > 8 else None
+            
+            if not user_id or not updated_at:
+                continue
+            
+            # Converter updated_at para datetime
+            if isinstance(updated_at, str):
+                # Tentar diferentes formatos
+                for fmt in ['%Y-%m-%d %H:%M:%S', '%Y-%m-%d %H:%M:%S.%f', '%Y-%m-%dT%H:%M:%S', '%Y-%m-%dT%H:%M:%S.%f']:
+                    try:
+                        updated_datetime = datetime.strptime(updated_at.split('+')[0].split('Z')[0], fmt)
+                        break
+                    except:
+                        continue
+                else:
+                    continue
+            elif hasattr(updated_at, 'replace'):  # datetime object
+                updated_datetime = updated_at.replace(tzinfo=None) if updated_at.tzinfo else updated_at
+            else:
+                continue
+            
+            # Verificar se está desatualizado
+            if updated_datetime >= limit_date:
+                continue  # Atualizado recentemente, pular
+            
+            # Calcular dias desde última atualização
+            days_since_update = (now - updated_datetime).days
+            
+            # Buscar membro no servidor
+            member = guild.get_member(int(user_id))
+            if not member:
+                continue
+            
+            # Verificar se ainda tem o cargo da guilda
+            if not has_guild_role(member):
+                continue
+            
+            # Calcular GS atual
+            gs_total = calculate_gs(ap, aap, dp)
+            
+            # Criar embed de lembrete
+            embed = discord.Embed(
+                title="⏰ Lembrete de Atualização de Gearscore",
+                description=(
+                    f"Olá **{member.display_name}**!\n\n"
+                    f"Seu gearscore não é atualizado há **{days_since_update} dias**.\n\n"
+                    f"📋 **Por favor, atualize seu gearscore usando `/atualizar`**\n\n"
+                    f"⚠️ **Importante:** Mesmo que você não tenha evoluído nada, "
+                    f"por favor preencha novamente. Isso é necessário para o **controle interno da guilda**."
+                ),
+                color=discord.Color.orange(),
+                timestamp=discord.utils.utcnow()
+            )
+            
+            embed.add_field(name="👤 Família", value=family_name, inline=True)
+            embed.add_field(name="⚔️ Classe", value=class_pvp, inline=True)
+            embed.add_field(name="📊 GS Atual", value=f"**{gs_total}**", inline=True)
+            embed.add_field(name="⚔️ AP", value=str(ap), inline=True)
+            embed.add_field(name="🔥 AAP", value=str(aap), inline=True)
+            embed.add_field(name="🛡️ DP", value=str(dp), inline=True)
+            
+            embed.add_field(
+                name="📝 Como atualizar",
+                value="Use o comando `/atualizar` com seus valores atuais de AP, AAP, DP e linkgear.",
+                inline=False
+            )
+            
+            embed.set_footer(text=f"Última atualização: {updated_datetime.strftime('%d/%m/%Y às %H:%M')}")
+            
+            # Enviar DM
+            try:
+                await member.send(embed=embed)
+                reminders_sent += 1
+                logger.info(f"Lembrete de GS enviado para {member.display_name} (ID: {user_id}) - {days_since_update} dias sem atualizar")
+            except discord.Forbidden:
+                logger.warning(f"Não foi possível enviar lembrete para {member.display_name} (ID: {user_id}) - DM bloqueada")
+            except Exception as e:
+                logger.error(f"Erro ao enviar lembrete para {member.display_name} (ID: {user_id}): {e}")
+                errors += 1
+                
+        except Exception as e:
+            logger.error(f"Erro ao processar registro para lembrete: {e}")
+            errors += 1
+    
+    return reminders_sent, errors
+
+# Task que roda diariamente para enviar lembretes
+@tasks.loop(hours=24)
+async def gs_reminder_task():
+    """Task que verifica e envia lembretes de atualização de GS diariamente"""
+    logger.info("Iniciando verificação de lembretes de atualização de GS...")
+    
+    for guild in bot.guilds:
+        try:
+            reminders_sent, errors = await check_gs_update_reminders(guild)
+            logger.info(f"Lembretes de GS para {guild.name}: {reminders_sent} enviados, {errors} erros")
+        except Exception as e:
+            logger.error(f"Erro ao processar lembretes para {guild.name}: {e}")
+    
+    logger.info("Verificação de lembretes de atualização de GS concluída")
+
+@gs_reminder_task.before_loop
+async def before_gs_reminder():
+    """Aguarda o bot estar pronto antes de iniciar a task"""
+    await bot.wait_until_ready()
+    
+    # Calcular tempo até a próxima execução no horário configurado
+    now = datetime.now()
+    target_time = now.replace(hour=GS_REMINDER_CHECK_HOUR, minute=0, second=0, microsecond=0)
+    
+    if now >= target_time:
+        # Se já passou do horário hoje, agendar para amanhã
+        target_time += timedelta(days=1)
+    
+    wait_seconds = (target_time - now).total_seconds()
+    logger.info(f"Task de lembrete de GS agendada para {target_time.strftime('%d/%m/%Y às %H:%M')} ({int(wait_seconds/3600)}h {int((wait_seconds%3600)/60)}min)")
+    
+    await discord.utils.sleep_until(target_time)
 
 # Função helper para enviar notificação ao canal
 async def send_notification_to_channel(bot, interaction, action_type, nome_familia, classe_pvp, ap, aap, dp, linkgear):
@@ -98,9 +323,10 @@ async def send_notification_to_channel(bot, interaction, action_type, nome_famil
             embed.set_footer(text=f"{action_type.capitalize()} por {interaction.user.display_name}")
             
             await channel.send(embed=embed)
+            logger.info(f"Notificação enviada ao canal: {action_type} - {nome_familia} ({classe_pvp})")
     except Exception as e:
         # Não interromper o fluxo principal se houver erro ao enviar notificação
-        print(f"Erro ao enviar notificação ao canal: {str(e)}")
+        logger.error(f"Erro ao enviar notificação ao canal (ID: {NOTIFICATION_CHANNEL_ID}): {str(e)}")
 
 # Função helper para enviar log de movimentação de membros
 async def send_move_log_to_channel(bot, interaction, origin_channel, destination_channel, moved_count, failed_count, failed_members):
@@ -168,18 +394,74 @@ async def send_move_log_to_channel(bot, interaction, origin_channel, destination
             embed.set_footer(text=f"Log gerado automaticamente")
             
             await channel.send(embed=embed)
+            logger.info(f"Log de movimentação enviado: {moved_count} membros movidos de {origin_channel.name} para {destination_channel.name}")
     except Exception as e:
         # Não interromper o fluxo principal se houver erro ao enviar log
-        print(f"Erro ao enviar log de movimentação ao canal: {str(e)}")
+        logger.error(f"Erro ao enviar log de movimentação ao canal (ID: {MOVE_LOG_CHANNEL_ID}): {str(e)}")
 
 @bot.event
 async def on_ready():
-    print(f'{bot.user} está online!')
+    logger.info(f'Bot está online! Usuário: {bot.user} (ID: {bot.user.id})')
+    logger.info(f'Bot está em {len(bot.guilds)} servidor(es)')
+    
     try:
         synced = await bot.tree.sync()
-        print(f'Sincronizados {len(synced)} comando(s)')
+        logger.info(f'Sincronizados {len(synced)} comando(s) slash')
     except Exception as e:
-        print(f'Erro ao sincronizar comandos: {e}')
+        logger.error(f'Erro ao sincronizar comandos: {e}')
+    
+    # Sincronizar cargos de registro de todos os membros da guilda
+    for guild in bot.guilds:
+        try:
+            await sync_registration_roles(guild)
+            logger.info(f'Cargos de registro sincronizados para {guild.name} (ID: {guild.id})')
+        except Exception as e:
+            logger.error(f'Erro ao sincronizar cargos em {guild.name} (ID: {guild.id}): {e}')
+    
+    # Iniciar task de lembrete de atualização de GS
+    if not gs_reminder_task.is_running():
+        gs_reminder_task.start()
+        logger.info(f'Task de lembrete de GS iniciada (verificação a cada {GS_UPDATE_REMINDER_DAYS} dias)')
+
+@bot.event
+async def on_member_update(before: discord.Member, after: discord.Member):
+    """Monitora mudanças de cargo dos membros para manter tracking de registro"""
+    # Verificar se o membro perdeu o cargo da guilda
+    had_guild_role = has_guild_role(before)
+    has_guild_role_now = has_guild_role(after)
+    
+    # Se perdeu o cargo membro, remover cargos de registro
+    if had_guild_role and not has_guild_role_now:
+        try:
+            registered_role = after.guild.get_role(REGISTERED_ROLE_ID)
+            unregistered_role = after.guild.get_role(UNREGISTERED_ROLE_ID)
+            
+            roles_to_remove = []
+            if registered_role and registered_role in after.roles:
+                roles_to_remove.append(registered_role)
+            if unregistered_role and unregistered_role in after.roles:
+                roles_to_remove.append(unregistered_role)
+            
+            if roles_to_remove:
+                await after.remove_roles(*roles_to_remove, reason="Perdeu cargo de membro da guilda")
+                logger.info(f'Cargos de registro removidos de {after.display_name} (ID: {after.id}) - perdeu cargo membro')
+        except Exception as e:
+            logger.error(f'Erro ao remover cargos de registro de {after.display_name} (ID: {after.id}): {e}')
+    
+    # Se ganhou o cargo membro, verificar se precisa do cargo "Não Registrado"
+    elif not had_guild_role and has_guild_role_now:
+        try:
+            # Verificar se tem registro
+            user_id = str(after.id)
+            user_gear = db.get_gearscore(user_id)
+            has_registration = bool(user_gear)
+            
+            # Atualizar cargos de registro
+            await update_registration_roles(after, has_registration)
+            status = "com registro" if has_registration else "sem registro"
+            logger.info(f'Cargos de registro atualizados para {after.display_name} (ID: {after.id}) - ganhou cargo membro ({status})')
+        except Exception as e:
+            logger.error(f'Erro ao atualizar cargos de registro de {after.display_name} (ID: {after.id}): {e}')
 
 @bot.event
 async def on_message(message: discord.Message):
@@ -224,18 +506,22 @@ async def on_message(message: discord.Message):
     # Processar comandos de prefixo (!) em servidores
     await bot.process_commands(message)
 
-# Autocomplete para classe PVP (limite de 25 resultados)
+# Autocomplete para classe PVP (com tratamento de erro para evitar spam de logs)
 async def classe_autocomplete(
     interaction: discord.Interaction,
     current: str,
 ) -> list[app_commands.Choice[str]]:
     """Autocomplete para classes do BDO"""
-    # Filtrar classes que começam com o texto digitado (case-insensitive)
-    filtered = [
-        classe for classe in BDO_CLASSES 
-        if current.lower() in classe.lower()
-    ][:25]  # Limitar a 25 resultados
-    return [app_commands.Choice(name=classe, value=classe) for classe in filtered]
+    try:
+        # Filtrar classes que começam com o texto digitado (case-insensitive)
+        filtered = [
+            classe for classe in BDO_CLASSES 
+            if current.lower() in classe.lower()
+        ][:25]  # Limitar a 25 resultados
+        return [app_commands.Choice(name=classe, value=classe) for classe in filtered]
+    except Exception:
+        # Se der erro (interação expirada), retornar lista vazia silenciosamente
+        return []
 
 @bot.tree.command(name="registro", description="Registra seu gearscore pela primeira vez")
 @app_commands.describe(
@@ -258,46 +544,47 @@ async def registro(
     dp: int,
     linkgear: str
 ):
-    # Validar valores numéricos
-    if ap < 0 or aap < 0 or dp < 0:
-        await interaction.response.send_message(
-            "❌ Os valores de AP, AAP e DP devem ser números positivos!",
-            ephemeral=True
-        )
-        return
-    
-    # Validar linkgear
-    if not linkgear or linkgear.strip() == "":
-        await interaction.response.send_message(
-            "❌ O link do gear é obrigatório!",
-            ephemeral=True
-        )
-        return
-    
-    # Validar classe PVP
-    if classe_pvp not in BDO_CLASSES:
-        classes_str = ", ".join(BDO_CLASSES[:10])  # Mostrar primeiras 10
-        await interaction.response.send_message(
-            f"❌ Classe inválida! Classes disponíveis: {classes_str}... (use autocomplete para ver todas)",
-            ephemeral=True
-        )
-        return
+    # Deferir resposta IMEDIATAMENTE para evitar timeout
+    await interaction.response.defer(ephemeral=True)
     
     try:
+        # Validar valores numéricos
+        if ap < 0 or aap < 0 or dp < 0:
+            await interaction.followup.send(
+                "❌ Os valores de AP, AAP e DP devem ser números positivos!",
+                ephemeral=True
+            )
+            return
+        
+        # Validar linkgear
+        if not linkgear or linkgear.strip() == "":
+            await interaction.followup.send(
+                "❌ O link do gear é obrigatório!",
+                ephemeral=True
+            )
+            return
+        
+        # Validar classe PVP
+        if classe_pvp not in BDO_CLASSES:
+            classes_str = ", ".join(BDO_CLASSES[:10])
+            await interaction.followup.send(
+                f"❌ Classe inválida! Classes disponíveis: {classes_str}... (use autocomplete para ver todas)",
+                ephemeral=True
+            )
+            return
+        
         user_id = str(interaction.user.id)
         
         # Verificar se é em um servidor (não DM)
         if not interaction.guild:
-            await interaction.response.send_message(
+            await interaction.followup.send(
                 "❌ Este comando só pode ser usado em um servidor!",
                 ephemeral=True
             )
             return
         
-        # Deferir resposta se a operação pode demorar (privado)
-        await interaction.response.defer(ephemeral=True)
-        
         # Registrar gearscore
+        logger.info(f"Comando /registro executado por {interaction.user.display_name} (ID: {interaction.user.id}) - {nome_familia} ({classe_pvp}) - GS: {calculate_gs(ap, aap, dp)}")
         db.register_gearscore(
             user_id=user_id,
             family_name=nome_familia,
@@ -309,17 +596,17 @@ async def registro(
             linkgear=linkgear
         )
         
-        # Adicionar cargo da guilda ao membro
+        # Adicionar cargo da guilda ao membro (se não tiver)
         member = interaction.guild.get_member(interaction.user.id)
         role_added = False
         role_error = None
         
         if member:
-            role = interaction.guild.get_role(GUILD_MEMBER_ROLE_ID)
-            if role:
+            guild_role = interaction.guild.get_role(GUILD_MEMBER_ROLE_ID)
+            if guild_role:
                 try:
                     if not has_guild_role(member):
-                        await member.add_roles(role, reason="Registro de gearscore - membro da guilda")
+                        await member.add_roles(guild_role, reason="Registro de gearscore - membro da guilda")
                         role_added = True
                 except discord.Forbidden:
                     role_error = "Sem permissão para adicionar cargo"
@@ -329,6 +616,10 @@ async def registro(
                 role_error = "Cargo da guilda não encontrado no servidor"
         else:
             role_error = "Membro não encontrado no servidor"
+        
+        # Atualizar cargos de registro (dar "Registrado" e remover "Não Registrado")
+        if member:
+            await update_registration_roles(member, has_registration=True)
         
         # Calcular GS total (MAX(AP, AAP) + DP)
         gs_total = calculate_gs(ap, aap, dp)
@@ -362,29 +653,11 @@ async def registro(
             nome_familia, classe_pvp, ap, aap, dp, linkgear
         )
     except ValueError as e:
-        # Verificar se já respondeu
-        if interaction.response.is_done():
-            await interaction.followup.send(
-                f"❌ {str(e)}",
-                ephemeral=True
-            )
-        else:
-            await interaction.response.send_message(
-                f"❌ {str(e)}",
-                ephemeral=True
-            )
+        logger.error(f"Erro de validação no /registro: {e}")
+        await interaction.followup.send(f"❌ {str(e)}", ephemeral=True)
     except Exception as e:
-        # Verificar se já respondeu
-        if interaction.response.is_done():
-            await interaction.followup.send(
-                f"❌ Erro ao registrar gearscore: {str(e)}",
-                ephemeral=True
-            )
-        else:
-            await interaction.response.send_message(
-                f"❌ Erro ao registrar gearscore: {str(e)}",
-                ephemeral=True
-            )
+        logger.error(f"Erro no comando /registro: {e}")
+        await interaction.followup.send(f"❌ Erro ao registrar gearscore: {str(e)}", ephemeral=True)
 
 @bot.tree.command(name="registro_manual", description="[ADMIN] Registra gearscore manualmente para outro membro")
 @app_commands.describe(
@@ -458,6 +731,7 @@ async def registro_manual(
         target_user_id = str(usuario.id)
         
         # Registrar gearscore para o usuário selecionado
+        logger.info(f"Comando /registro_manual executado por {interaction.user.display_name} (ID: {interaction.user.id}) para {usuario.display_name} (ID: {target_user_id}) - {nome_familia} ({classe_pvp}) - GS: {calculate_gs(ap, aap, dp)}")
         db.register_gearscore(
             user_id=target_user_id,
             family_name=nome_familia,
@@ -469,17 +743,17 @@ async def registro_manual(
             linkgear=linkgear
         )
         
-        # Adicionar cargo da guilda ao membro selecionado
+        # Adicionar cargo da guilda ao membro selecionado (se não tiver)
         member = interaction.guild.get_member(usuario.id)
         role_added = False
         role_error = None
         
         if member:
-            role = interaction.guild.get_role(GUILD_MEMBER_ROLE_ID)
-            if role:
+            guild_role = interaction.guild.get_role(GUILD_MEMBER_ROLE_ID)
+            if guild_role:
                 try:
                     if not has_guild_role(member):
-                        await member.add_roles(role, reason=f"Registro manual de gearscore por {interaction.user.display_name}")
+                        await member.add_roles(guild_role, reason=f"Registro manual de gearscore por {interaction.user.display_name}")
                         role_added = True
                 except discord.Forbidden:
                     role_error = "Sem permissão para adicionar cargo"
@@ -489,6 +763,10 @@ async def registro_manual(
                 role_error = "Cargo da guilda não encontrado no servidor"
         else:
             role_error = "Membro não encontrado no servidor"
+        
+        # Atualizar cargos de registro (dar "Registrado" e remover "Não Registrado")
+        if member:
+            await update_registration_roles(member, has_registration=True)
         
         # Calcular GS total (MAX(AP, AAP) + DP)
         gs_total = calculate_gs(ap, aap, dp)
@@ -544,7 +822,7 @@ async def registro_manual(
                 
                 await channel.send(embed=embed)
         except Exception as e:
-            print(f"Erro ao enviar notificação: {e}")
+            logger.error(f"Erro ao enviar notificação ao canal (ID: {NOTIFICATION_CHANNEL_ID}): {e}")
         
         # Enviar DM para o usuário informando sobre o registro manual
         try:
@@ -565,7 +843,7 @@ async def registro_manual(
             pass
         except Exception as e:
             # Erro ao enviar DM, não é crítico
-            print(f"Erro ao enviar DM para {usuario.id}: {e}")
+            logger.warning(f"Erro ao enviar DM para usuário (ID: {usuario.id}): {e}")
         
     except ValueError as e:
         # Verificar se já respondeu
@@ -613,29 +891,32 @@ async def atualizar(
     nome_personagem: str = None,
     classe_pvp: str = None
 ):
-    # Validar valores numéricos
-    if ap < 0 or aap < 0 or dp < 0:
-        await interaction.response.send_message(
-            "❌ Os valores de AP, AAP e DP devem ser números positivos!",
-            ephemeral=True
-        )
-        return
-    
-    # Validar linkgear
-    if not linkgear or linkgear.strip() == "":
-        await interaction.response.send_message(
-            "❌ O link do gear é obrigatório!",
-            ephemeral=True
-        )
-        return
+    # Deferir resposta IMEDIATAMENTE para evitar timeout
+    await interaction.response.defer(ephemeral=True)
     
     try:
+        # Validar valores numéricos
+        if ap < 0 or aap < 0 or dp < 0:
+            await interaction.followup.send(
+                "❌ Os valores de AP, AAP e DP devem ser números positivos!",
+                ephemeral=True
+            )
+            return
+        
+        # Validar linkgear
+        if not linkgear or linkgear.strip() == "":
+            await interaction.followup.send(
+                "❌ O link do gear é obrigatório!",
+                ephemeral=True
+            )
+            return
+        
         user_id = str(interaction.user.id)
         
-        # Verificar se já existe registro (operação rápida)
+        # Verificar se já existe registro
         current_data = db.get_user_current_data(user_id)
         if not current_data:
-            await interaction.response.send_message(
+            await interaction.followup.send(
                 "❌ Você ainda não possui um registro! Use `/registro` primeiro.",
                 ephemeral=True
             )
@@ -645,8 +926,8 @@ async def atualizar(
         
         # Validar classe PVP se fornecida
         if classe_pvp and classe_pvp not in BDO_CLASSES:
-            classes_str = ", ".join(BDO_CLASSES[:10])  # Mostrar primeiras 10
-            await interaction.response.send_message(
+            classes_str = ", ".join(BDO_CLASSES[:10])
+            await interaction.followup.send(
                 f"❌ Classe inválida! Classes disponíveis: {classes_str}... (use autocomplete para ver todas)",
                 ephemeral=True
             )
@@ -660,17 +941,16 @@ async def atualizar(
         if nome_familia is None:
             nome_familia = current_family_name
         
-        # Se mudou de classe, o nome do personagem é OBRIGATÓRIO (é um personagem diferente)
+        # Se mudou de classe, o nome do personagem é OBRIGATÓRIO
         if classe_pvp != current_class_pvp:
             if nome_personagem is None or nome_personagem.strip() == "":
-                # Mudou de classe mas não forneceu nome do personagem
-                # Enviar DM solicitando o nome do personagem
+                # Tentar enviar DM (sem bloquear)
                 try:
                     dm_embed = discord.Embed(
                         title="⚠️ Nome do Personagem Obrigatório",
                         description=f"Você está mudando de classe de **{current_class_pvp}** para **{classe_pvp}**.\n\n"
                                    f"Como você está mudando para um personagem diferente, é **obrigatório** fornecer o nome do novo personagem.\n\n"
-                                   f"Por favor, use o comando `/atualizar` novamente incluindo o parâmetro `nome_personagem` com o nome do seu novo personagem.",
+                                   f"Por favor, use o comando `/atualizar` novamente incluindo o parâmetro `nome_personagem`.",
                         color=discord.Color.orange(),
                         timestamp=discord.utils.utcnow()
                     )
@@ -680,15 +960,13 @@ async def atualizar(
                         inline=False
                     )
                     await interaction.user.send(embed=dm_embed)
-                except discord.Forbidden:
-                    # Se não conseguir enviar DM, mostrar erro no canal
+                except:
                     pass
                 
-                await interaction.response.send_message(
+                await interaction.followup.send(
                     f"❌ **Nome do personagem obrigatório!**\n\n"
                     f"Você está mudando de classe de **{current_class_pvp}** para **{classe_pvp}**.\n"
                     f"Como você está mudando para um personagem diferente, é **obrigatório** fornecer o nome do novo personagem.\n\n"
-                    f"Por favor, use o comando `/atualizar` novamente incluindo o parâmetro `nome_personagem`.\n\n"
                     f"**Exemplo:** `/atualizar ap:{ap} aap:{aap} dp:{dp} linkgear:{linkgear} nome_personagem:NovoNome classe_pvp:{classe_pvp}`",
                     ephemeral=True
                 )
@@ -698,10 +976,8 @@ async def atualizar(
         if nome_personagem is None:
             nome_personagem = current_character_name
         
-        # Deferir resposta antes de operações que podem demorar (privado)
-        await interaction.response.defer(ephemeral=True)
-        
-        # Atualizar gearscore (pode demorar com banco de dados)
+        # Atualizar gearscore
+        logger.info(f"Comando /atualizar executado por {interaction.user.display_name} (ID: {user_id}) - {nome_familia} ({classe_pvp}) - GS: {calculate_gs(ap, aap, dp)}")
         db.update_gearscore(
             user_id=user_id,
             family_name=nome_familia,
@@ -712,8 +988,9 @@ async def atualizar(
             dp=dp,
             linkgear=linkgear
         )
+        logger.info(f"Gearscore atualizado com sucesso para {interaction.user.display_name} (ID: {user_id})")
         
-        # Calcular GS total (MAX(AP, AAP) + DP)
+        # Calcular GS total
         gs_total = calculate_gs(ap, aap, dp)
         
         embed = discord.Embed(
@@ -748,17 +1025,11 @@ async def atualizar(
             nome_familia, classe_pvp, ap, aap, dp, linkgear
         )
     except Exception as e:
-        # Verificar se já respondeu (defer foi chamado)
-        if interaction.response.is_done():
-            await interaction.followup.send(
-                f"❌ Erro ao atualizar gearscore: {str(e)}",
-                ephemeral=True
-            )
-        else:
-            await interaction.response.send_message(
-                f"❌ Erro ao atualizar gearscore: {str(e)}",
-                ephemeral=True
-            )
+        logger.error(f"Erro no comando /atualizar: {e}")
+        await interaction.followup.send(
+            f"❌ Erro ao atualizar gearscore: {str(e)}",
+            ephemeral=True
+        )
 
 # Função auxiliar para gerar perfil (reutilizável)
 async def generate_profile_embed(interaction: discord.Interaction, target_user: discord.Member, target_user_id: str = None):
@@ -1078,6 +1349,586 @@ async def pre(interaction: discord.Interaction, usuario: discord.Member):
                 ephemeral=True
             )
 
+# ==================== SISTEMA DE ESTATÍSTICAS DE CLASSES ====================
+
+# Modal para enviar DM personalizada
+class SendDMModal(discord.ui.Modal, title="📨 Enviar Notificação"):
+    def __init__(self, member: discord.Member, family_name: str):
+        super().__init__()
+        self.target_member = member
+        self.family_name = family_name
+    
+    message = discord.ui.TextInput(
+        label="Mensagem",
+        style=discord.TextStyle.paragraph,
+        placeholder="Digite a mensagem que será enviada para o membro...",
+        required=True,
+        max_length=1000
+    )
+    
+    async def on_submit(self, interaction: discord.Interaction):
+        try:
+            dm_embed = discord.Embed(
+                title="📨 Notificação da Staff",
+                description=self.message.value,
+                color=discord.Color.orange(),
+                timestamp=discord.utils.utcnow()
+            )
+            dm_embed.set_footer(text="Staff Mouz")
+            
+            await self.target_member.send(embed=dm_embed)
+            
+            await interaction.response.send_message(
+                f"✅ Mensagem enviada com sucesso para **{self.family_name}** ({self.target_member.display_name})!",
+                ephemeral=True
+            )
+            logger.info(f"DM enviada para {self.target_member.display_name} (ID: {self.target_member.id}) via estatísticas de classes")
+        except discord.Forbidden:
+            await interaction.response.send_message(
+                f"❌ Não foi possível enviar DM para **{self.family_name}**. O usuário pode ter DMs desabilitadas.",
+                ephemeral=True
+            )
+        except Exception as e:
+            await interaction.response.send_message(
+                f"❌ Erro ao enviar DM: {str(e)}",
+                ephemeral=True
+            )
+
+
+# Modal para DM em massa para toda a classe
+class MassDMModal(discord.ui.Modal, title="📢 Notificação em Massa"):
+    def __init__(self, class_members: list, guild: discord.Guild, class_name: str):
+        super().__init__()
+        self.class_members = class_members
+        self.guild = guild
+        self.class_name = class_name
+    
+    message = discord.ui.TextInput(
+        label="Mensagem para todos da classe",
+        style=discord.TextStyle.paragraph,
+        placeholder="Esta mensagem será enviada para TODOS os membros desta classe...",
+        required=True,
+        max_length=1000
+    )
+    
+    async def on_submit(self, interaction: discord.Interaction):
+        await interaction.response.defer(ephemeral=True)
+        
+        sent = 0
+        failed = 0
+        
+        dm_embed = discord.Embed(
+            title=f"📢 Aviso para {self.class_name}s",
+            description=self.message.value,
+            color=discord.Color.blue(),
+            timestamp=discord.utils.utcnow()
+        )
+        dm_embed.set_footer(text="Staff Mouz")
+        
+        for family, display, gs, ap, aap, dp, uid, link in self.class_members:
+            member = self.guild.get_member(int(uid)) if uid else None
+            if member:
+                try:
+                    await member.send(embed=dm_embed)
+                    sent += 1
+                except:
+                    failed += 1
+        
+        await interaction.followup.send(
+            f"✅ **Notificação em massa enviada!**\n\n"
+            f"📤 Enviadas: **{sent}**\n"
+            f"❌ Falhas: **{failed}** (DMs bloqueadas)",
+            ephemeral=True
+        )
+        logger.info(f"DM em massa enviada para classe {self.class_name}: {sent} enviadas, {failed} falhas")
+
+
+# Helper para calcular indicador de GS
+def get_gs_indicator(gs: int, avg_gs: float) -> str:
+    """Retorna emoji indicador baseado no GS comparado à média"""
+    if gs >= avg_gs + 10:
+        return "🟢"  # Acima da média (+10)
+    elif gs >= avg_gs - 10:
+        return "🟡"  # Na média (±10)
+    elif gs >= avg_gs - 20:
+        return "🟠"  # Pouco abaixo (-10 a -20)
+    else:
+        return "🔴"  # Muito abaixo (-20 ou mais)
+
+
+# Helper para criar embed de membros da classe
+def create_class_members_embed(class_members: list, selected_class: str, filter_type: str = "all", guild_avg_gs: int = 0):
+    """Cria embed formatado com membros da classe"""
+    
+    # Aplicar filtro
+    if filter_type == "no_link":
+        filtered = [m for m in class_members if not m[7] or not m[7].startswith('http')]
+        filter_text = "🔗 Filtro: Sem Link de Gear"
+    elif filter_type == "low_gs":
+        avg = sum(m[2] for m in class_members) / len(class_members) if class_members else 0
+        filtered = [m for m in class_members if m[2] < avg]
+        filter_text = "📉 Filtro: GS Abaixo da Média"
+    else:
+        filtered = class_members
+        filter_text = "📋 Todos os Membros"
+    
+    # Calcular média para indicadores
+    avg_gs = sum(m[2] for m in class_members) / len(class_members) if class_members else 0
+    
+    embed = discord.Embed(
+        title=f"⚔️ {selected_class} — {len(filtered)}/{len(class_members)} membros",
+        description=f"**{filter_text}**\n\n"
+                    f"🎯 GS Médio da Classe: **{int(avg_gs)}**\n"
+                    f"🌐 GS Médio da Guilda: **{guild_avg_gs}**",
+        color=discord.Color.blue(),
+        timestamp=discord.utils.utcnow()
+    )
+    
+    if filtered:
+        members_text = ""
+        for i, (family, display, gs, ap, aap, dp, uid, link) in enumerate(filtered, 1):
+            # Indicador visual de GS
+            indicator = get_gs_indicator(gs, avg_gs)
+            
+            # Link do gear
+            if link and link.startswith('http'):
+                gear_link = f"[🔗 Gear]({link})"
+            else:
+                gear_link = "⚠️ Sem link"
+            
+            line = f"{indicator} **{family}** • GS: **{gs}** • {gear_link}\n"
+            
+            if len(members_text) + len(line) > 950:
+                embed.add_field(name="📋 Lista", value=members_text, inline=False)
+                members_text = line
+            else:
+                members_text += line
+        
+        if members_text:
+            field_name = "📋 Lista" if len(embed.fields) == 0 else "📋 Continuação"
+            embed.add_field(name=field_name, value=members_text, inline=False)
+        
+        # Estatísticas
+        min_gs = min(m[2] for m in filtered)
+        max_gs = max(m[2] for m in filtered)
+        with_link = sum(1 for m in filtered if m[7] and m[7].startswith('http'))
+        without_link = len(filtered) - with_link
+        
+        embed.add_field(
+            name="📊 Estatísticas",
+            value=f"**Menor:** {min_gs} │ **Maior:** {max_gs}\n"
+                  f"**🔗 Com Link:** {with_link} │ **⚠️ Sem Link:** {without_link}",
+            inline=False
+        )
+        
+        # Legenda dos indicadores
+        embed.add_field(
+            name="🚦 Legenda",
+            value="🟢 Acima (+10) │ 🟡 Na média (±10) │ 🟠 Abaixo (-10 a -20) │ 🔴 Muito abaixo (-20+)",
+            inline=False
+        )
+    else:
+        embed.add_field(name="📋 Lista", value="*Nenhum membro encontrado com este filtro*", inline=False)
+    
+    return embed
+
+
+# Select para escolher membro e enviar DM
+class MemberDMSelect(discord.ui.Select):
+    def __init__(self, class_members: list, guild: discord.Guild):
+        self.class_members = class_members
+        self.guild = guild
+        
+        options = []
+        for i, (family, display, gs, ap, aap, dp, uid, link) in enumerate(class_members[:25]):
+            has_link = "🔗" if link and link.startswith('http') else "⚠️"
+            options.append(
+                discord.SelectOption(
+                    label=f"{family}",
+                    description=f"GS: {gs} │ {display} │ {has_link}",
+                    value=str(uid),
+                    emoji="📨"
+                )
+            )
+        
+        super().__init__(
+            placeholder="📨 Enviar DM individual...",
+            options=options,
+            min_values=1,
+            max_values=1,
+            row=1
+        )
+    
+    async def callback(self, interaction: discord.Interaction):
+        user_id = self.values[0]
+        member = self.guild.get_member(int(user_id))
+        
+        if not member:
+            await interaction.response.send_message("❌ Membro não encontrado!", ephemeral=True)
+            return
+        
+        family_name = next((f for f, d, g, a, aa, dp, u, l in self.class_members if str(u) == user_id), "Membro")
+        modal = SendDMModal(member, family_name)
+        await interaction.response.send_modal(modal)
+
+
+# Select de filtros
+class FilterSelect(discord.ui.Select):
+    def __init__(self, parent_view):
+        self.parent_view = parent_view
+        
+        options = [
+            discord.SelectOption(label="Todos os Membros", value="all", emoji="📋", description="Mostrar todos"),
+            discord.SelectOption(label="Sem Link de Gear", value="no_link", emoji="⚠️", description="Membros que precisam adicionar link"),
+            discord.SelectOption(label="GS Abaixo da Média", value="low_gs", emoji="📉", description="Membros com GS menor que a média"),
+        ]
+        
+        super().__init__(
+            placeholder="🔍 Filtrar membros...",
+            options=options,
+            min_values=1,
+            max_values=1,
+            row=2
+        )
+    
+    async def callback(self, interaction: discord.Interaction):
+        filter_type = self.values[0]
+        self.parent_view.current_filter = filter_type
+        
+        embed = create_class_members_embed(
+            self.parent_view.current_class_members,
+            self.parent_view.current_class,
+            filter_type,
+            self.parent_view.guild_avg_gs
+        )
+        
+        await interaction.response.edit_message(embed=embed, view=self.parent_view)
+
+
+# Botões de ação rápida
+class QuickActionButtons(discord.ui.View):
+    pass  # Placeholder
+
+
+class MassDMButton(discord.ui.Button):
+    def __init__(self, parent_view):
+        super().__init__(
+            style=discord.ButtonStyle.primary,
+            label="📢 DM em Massa",
+            custom_id="mass_dm",
+            row=3
+        )
+        self.parent_view = parent_view
+    
+    async def callback(self, interaction: discord.Interaction):
+        if not self.parent_view.current_class_members:
+            await interaction.response.send_message("❌ Nenhum membro na lista!", ephemeral=True)
+            return
+        
+        modal = MassDMModal(
+            self.parent_view.current_class_members,
+            self.parent_view.guild,
+            self.parent_view.current_class
+        )
+        await interaction.response.send_modal(modal)
+
+
+class RequestUpdateButton(discord.ui.Button):
+    def __init__(self, parent_view):
+        super().__init__(
+            style=discord.ButtonStyle.secondary,
+            label="🔄 Pedir Atualização",
+            custom_id="request_update",
+            row=3
+        )
+        self.parent_view = parent_view
+    
+    async def callback(self, interaction: discord.Interaction):
+        await interaction.response.defer(ephemeral=True)
+        
+        sent = 0
+        failed = 0
+        
+        dm_embed = discord.Embed(
+            title="🔄 Solicitação de Atualização",
+            description=f"Olá! A Staff da **Mouz** está solicitando que você atualize seu gearscore.\n\n"
+                        f"Por favor, use o comando `/atualizar` para manter seus dados em dia.\n\n"
+                        f"*Mesmo que não tenha evoluído, atualize para controle interno da guilda.*",
+            color=discord.Color.orange(),
+            timestamp=discord.utils.utcnow()
+        )
+        dm_embed.set_footer(text="Staff Mouz")
+        
+        for family, display, gs, ap, aap, dp, uid, link in self.parent_view.current_class_members:
+            member = self.parent_view.guild.get_member(int(uid)) if uid else None
+            if member:
+                try:
+                    await member.send(embed=dm_embed)
+                    sent += 1
+                except:
+                    failed += 1
+        
+        await interaction.followup.send(
+            f"✅ **Solicitação de atualização enviada!**\n"
+            f"📤 Enviadas: **{sent}** │ ❌ Falhas: **{failed}**",
+            ephemeral=True
+        )
+
+
+class RequestLinkButton(discord.ui.Button):
+    def __init__(self, parent_view):
+        super().__init__(
+            style=discord.ButtonStyle.secondary,
+            label="🔗 Pedir Link",
+            custom_id="request_link",
+            row=3
+        )
+        self.parent_view = parent_view
+    
+    async def callback(self, interaction: discord.Interaction):
+        await interaction.response.defer(ephemeral=True)
+        
+        # Filtrar apenas quem não tem link
+        no_link_members = [m for m in self.parent_view.current_class_members if not m[7] or not m[7].startswith('http')]
+        
+        if not no_link_members:
+            await interaction.followup.send("✅ Todos os membros desta classe já têm link de gear!", ephemeral=True)
+            return
+        
+        sent = 0
+        failed = 0
+        
+        dm_embed = discord.Embed(
+            title="🔗 Solicitação de Link de Gear",
+            description=f"Olá! Notamos que você ainda não adicionou o **link do seu gear** no registro.\n\n"
+                        f"Por favor, use o comando `/atualizar` e inclua o link do seu gear (bdoplanner ou similar).\n\n"
+                        f"*O link ajuda a staff a visualizar seu equipamento completo.*",
+            color=discord.Color.orange(),
+            timestamp=discord.utils.utcnow()
+        )
+        dm_embed.set_footer(text="Staff Mouz")
+        
+        for family, display, gs, ap, aap, dp, uid, link in no_link_members:
+            member = self.parent_view.guild.get_member(int(uid)) if uid else None
+            if member:
+                try:
+                    await member.send(embed=dm_embed)
+                    sent += 1
+                except:
+                    failed += 1
+        
+        await interaction.followup.send(
+            f"✅ **Solicitação de link enviada!**\n"
+            f"📤 Enviadas: **{sent}** │ ❌ Falhas: **{failed}**",
+            ephemeral=True
+        )
+
+
+class ExportListButton(discord.ui.Button):
+    def __init__(self, parent_view):
+        super().__init__(
+            style=discord.ButtonStyle.secondary,
+            label="📋 Exportar Lista",
+            custom_id="export_list",
+            row=4
+        )
+        self.parent_view = parent_view
+    
+    async def callback(self, interaction: discord.Interaction):
+        if not self.parent_view.current_class_members:
+            await interaction.response.send_message("❌ Nenhum membro na lista!", ephemeral=True)
+            return
+        
+        # Criar lista formatada
+        export_text = f"📋 **{self.parent_view.current_class}** - {len(self.parent_view.current_class_members)} membros\n"
+        export_text += "```\n"
+        export_text += f"{'#':<3} {'Família':<20} {'GS':<6} {'AP':<4} {'AAP':<4} {'DP':<4} {'Link':<5}\n"
+        export_text += "-" * 50 + "\n"
+        
+        for i, (family, display, gs, ap, aap, dp, uid, link) in enumerate(self.parent_view.current_class_members, 1):
+            has_link = "Sim" if link and link.startswith('http') else "Não"
+            family_short = family[:18] + ".." if len(family) > 20 else family
+            export_text += f"{i:<3} {family_short:<20} {gs:<6} {ap:<4} {aap:<4} {dp:<4} {has_link:<5}\n"
+        
+        export_text += "```"
+        
+        # Se for muito longo, enviar em partes
+        if len(export_text) > 2000:
+            export_text = export_text[:1990] + "...\n```"
+        
+        await interaction.response.send_message(export_text, ephemeral=True)
+
+
+class ClassStatsBackButton(discord.ui.Button):
+    def __init__(self, parent_view):
+        super().__init__(
+            style=discord.ButtonStyle.danger,
+            label="◀️ Voltar",
+            custom_id="back_to_stats",
+            row=4
+        )
+        self.parent_view = parent_view
+    
+    async def callback(self, interaction: discord.Interaction):
+        self.parent_view.reset_to_original()
+        await interaction.response.edit_message(embed=self.parent_view.original_embed, view=self.parent_view)
+
+
+# View interativa para estatísticas de classes
+class ClassStatsSelect(discord.ui.Select):
+    def __init__(self, stats_data: list, guild: discord.Guild, valid_user_ids: list, parent_view):
+        self.stats_data = stats_data
+        self.guild = guild
+        self.valid_user_ids = valid_user_ids
+        self.parent_view = parent_view
+        
+        options = []
+        for class_name, total, avg_gs in stats_data[:25]:
+            avg_gs_int = int(round(avg_gs)) if avg_gs else 0
+            options.append(
+                discord.SelectOption(
+                    label=class_name,
+                    description=f"{total} membro(s) • GS Médio: {avg_gs_int}",
+                    value=class_name,
+                    emoji="⚔️"
+                )
+            )
+        
+        super().__init__(
+            placeholder="📋 Selecione uma classe...",
+            options=options,
+            min_values=1,
+            max_values=1,
+            row=0
+        )
+    
+    async def callback(self, interaction: discord.Interaction):
+        selected_class = self.values[0]
+        
+        # Buscar membros da classe
+        all_gearscores = db.get_all_gearscores(valid_user_ids=self.valid_user_ids)
+        
+        class_members = []
+        for record in all_gearscores:
+            if isinstance(record, dict):
+                class_pvp = record.get('class_pvp', '')
+                user_id = record.get('user_id', '')
+                family_name = record.get('family_name', 'N/A')
+                ap = record.get('ap', 0)
+                aap = record.get('aap', 0)
+                dp = record.get('dp', 0)
+                linkgear = record.get('linkgear', '')
+            else:
+                class_pvp = record[4] if len(record) > 4 else ''
+                user_id = record[1] if len(record) > 1 else ''
+                family_name = record[2] if len(record) > 2 else 'N/A'
+                ap = record[5] if len(record) > 5 else 0
+                aap = record[6] if len(record) > 6 else 0
+                dp = record[7] if len(record) > 7 else 0
+                linkgear = record[8] if len(record) > 8 else ''
+            
+            if class_pvp == selected_class:
+                gs_total = max(int(ap or 0), int(aap or 0)) + int(dp or 0)
+                member = self.guild.get_member(int(user_id)) if user_id else None
+                display_name = member.display_name if member else "Desconhecido"
+                class_members.append((family_name, display_name, gs_total, ap, aap, dp, user_id, linkgear))
+        
+        # Ordenar por GS
+        class_members.sort(key=lambda x: x[2], reverse=True)
+        
+        # Salvar na view
+        self.parent_view.current_class_members = class_members
+        self.parent_view.current_class = selected_class
+        self.parent_view.current_filter = "all"
+        
+        # Criar embed
+        embed = create_class_members_embed(class_members, selected_class, "all", self.parent_view.guild_avg_gs)
+        
+        # Atualizar view
+        self.parent_view.update_for_class_view(class_members)
+        
+        await interaction.response.edit_message(embed=embed, view=self.parent_view)
+
+
+class ClassStatsView(discord.ui.View):
+    def __init__(self, stats_data: list, guild: discord.Guild, valid_user_ids: list, original_embed: discord.Embed, guild_avg_gs: int = 0):
+        super().__init__(timeout=600)  # 10 minutos de timeout
+        self.stats_data = stats_data
+        self.guild = guild
+        self.valid_user_ids = valid_user_ids
+        self.original_embed = original_embed
+        self.guild_avg_gs = guild_avg_gs
+        self.current_class_members = []
+        self.current_class = ""
+        self.current_filter = "all"
+        
+        # Select de classes
+        self.class_select = ClassStatsSelect(stats_data, guild, valid_user_ids, self)
+        self.add_item(self.class_select)
+        
+        # Componentes dinâmicos
+        self.dm_select = None
+        self.filter_select = None
+        self.mass_dm_btn = None
+        self.request_update_btn = None
+        self.request_link_btn = None
+        self.export_btn = None
+        self.back_button = None
+    
+    def update_for_class_view(self, class_members: list):
+        """Adiciona todos os componentes quando uma classe é selecionada"""
+        # Limpar componentes antigos
+        self._clear_dynamic_components()
+        
+        if class_members:
+            # Select de DM individual
+            self.dm_select = MemberDMSelect(class_members, self.guild)
+            self.add_item(self.dm_select)
+            
+            # Select de filtros
+            self.filter_select = FilterSelect(self)
+            self.add_item(self.filter_select)
+            
+            # Botões de ação
+            self.mass_dm_btn = MassDMButton(self)
+            self.add_item(self.mass_dm_btn)
+            
+            self.request_update_btn = RequestUpdateButton(self)
+            self.add_item(self.request_update_btn)
+            
+            self.request_link_btn = RequestLinkButton(self)
+            self.add_item(self.request_link_btn)
+            
+            self.export_btn = ExportListButton(self)
+            self.add_item(self.export_btn)
+        
+        # Botão voltar sempre
+        self.back_button = ClassStatsBackButton(self)
+        self.add_item(self.back_button)
+    
+    def _clear_dynamic_components(self):
+        """Remove componentes dinâmicos"""
+        for component in [self.dm_select, self.filter_select, self.mass_dm_btn, 
+                         self.request_update_btn, self.request_link_btn, 
+                         self.export_btn, self.back_button]:
+            if component and component in self.children:
+                self.remove_item(component)
+    
+    def reset_to_original(self):
+        """Reseta para o estado original"""
+        self._clear_dynamic_components()
+        self.dm_select = None
+        self.filter_select = None
+        self.mass_dm_btn = None
+        self.request_update_btn = None
+        self.request_link_btn = None
+        self.export_btn = None
+        self.back_button = None
+        self.current_class_members = []
+        self.current_class = ""
+        self.current_filter = "all"
+
+
 @bot.tree.command(name="estatisticas_classes", description="[ADMIN] Mostra estatísticas das classes na guilda")
 @app_commands.default_permissions(administrator=True)
 async def estatisticas_classes(interaction: discord.Interaction):
@@ -1088,12 +1939,16 @@ async def estatisticas_classes(interaction: discord.Interaction):
             ephemeral=True
         )
         return
+    
+    # Defer para evitar timeout (o comando pode demorar)
+    await interaction.response.defer(ephemeral=True)
+    
     try:
         # Buscar apenas membros que têm o cargo da guilda
         valid_user_ids = await get_guild_member_ids(interaction.guild)
         
         if not valid_user_ids:
-            await interaction.response.send_message(
+            await interaction.followup.send(
                 "❌ Nenhum membro com o cargo da guilda encontrado!",
                 ephemeral=True
             )
@@ -1102,7 +1957,7 @@ async def estatisticas_classes(interaction: discord.Interaction):
         stats = db.get_class_statistics(valid_user_ids=valid_user_ids)
         
         if not stats:
-            await interaction.response.send_message(
+            await interaction.followup.send(
                 "❌ Nenhum gearscore cadastrado ainda!",
                 ephemeral=True
             )
@@ -1136,6 +1991,9 @@ async def estatisticas_classes(interaction: discord.Interaction):
             
             stats_list.append((class_name, total, avg_gs))
         
+        # ✅ ORDENAR por quantidade (maior para menor)
+        stats_list.sort(key=lambda x: x[1], reverse=True)
+        
         # Calcular GS médio geral (média ponderada)
         overall_avg_gs = int(round(total_weighted_gs / total_chars)) if total_chars > 0 else 0
         
@@ -1144,7 +2002,7 @@ async def estatisticas_classes(interaction: discord.Interaction):
         
         embed = discord.Embed(
             title="🎭 Estatísticas das Classes - Guilda",
-            description="Distribuição e GS médio por classe",
+            description="📊 Distribuição e GS médio por classe\n\n*Selecione uma classe no menu abaixo para ver os membros*",
             color=discord.Color.purple(),
             timestamp=discord.utils.utcnow()
         )
@@ -1152,33 +2010,59 @@ async def estatisticas_classes(interaction: discord.Interaction):
         # Adicionar GS médio geral e sem Shai lado a lado
         embed.add_field(
             name="📊 GS Médio Geral",
-            value=f"**{overall_avg_gs}** (todas as classes)",
+            value=f"**{overall_avg_gs}**",
             inline=True
         )
         
         embed.add_field(
-            name="📊 GS Médio Sem Shai",
-            value=f"**{overall_avg_gs_sem_shai}** (excluindo Shai)",
+            name="📊 GS Médio (Sem Shai)",
+            value=f"**{overall_avg_gs_sem_shai}**",
             inline=True
         )
         
-        # Adicionar campos das classes individuais
-        for class_name, total, avg_gs in stats_list:
-            avg_gs_int = int(round(avg_gs)) if avg_gs else 0
-            embed.add_field(
-                name=f"{class_name}",
-                value=f"👥 **{total}** membro(s)\n📊 GS Médio: **{avg_gs_int}**",
-                inline=True
-            )
+        embed.add_field(name="\u200b", value="\u200b", inline=True)  # Espaçador
         
-        embed.set_footer(text=f"Total de {total_chars} personagens cadastrados (apenas membros com cargo da guilda)")
-        await interaction.response.send_message(embed=embed)
+        # Criar lista formatada das classes (ordenada por quantidade)
+        class_ranking = ""
+        for i, (class_name, total, avg_gs) in enumerate(stats_list, 1):
+            avg_gs_int = int(round(avg_gs)) if avg_gs else 0
+            # Emoji baseado na posição
+            if i == 1:
+                medal = "🥇"
+            elif i == 2:
+                medal = "🥈"
+            elif i == 3:
+                medal = "🥉"
+            else:
+                medal = f"`{i:2d}`"
+            
+            class_ranking += f"{medal} **{class_name}** — {total} membro(s) • GS: {avg_gs_int}\n"
+        
+        embed.add_field(
+            name="🏆 Ranking de Classes (por quantidade)",
+            value=class_ranking if class_ranking else "Nenhuma classe encontrada",
+            inline=False
+        )
+        
+        embed.set_footer(text=f"Total de {total_chars} personagens cadastrados • Selecione uma classe abaixo")
+        
+        # Criar a View com o menu interativo
+        view = ClassStatsView(stats_list, interaction.guild, valid_user_ids, embed, overall_avg_gs)
+        
+        await interaction.followup.send(embed=embed, view=view, ephemeral=True)
         
     except Exception as e:
-        await interaction.response.send_message(
-            f"❌ Erro ao buscar estatísticas: {str(e)}",
-            ephemeral=True
-        )
+        logger.error(f"Erro ao buscar estatísticas de classes: {e}")
+        if interaction.response.is_done():
+            await interaction.followup.send(
+                f"❌ Erro ao buscar estatísticas: {str(e)}",
+                ephemeral=True
+            )
+        else:
+            await interaction.response.send_message(
+                f"❌ Erro ao buscar estatísticas: {str(e)}",
+                ephemeral=True
+            )
 
 @bot.tree.command(name="stats", description="[ADMIN] Mostra estatísticas completas de todos os membros")
 @app_commands.default_permissions(administrator=True)
@@ -1654,7 +2538,7 @@ async def membros_classe(interaction: discord.Interaction, classe: str):
     except Exception as e:
         import traceback
         error_details = traceback.format_exc()
-        print(f"Erro ao buscar membros da classe: {error_details}")
+        logger.error(f"Erro ao buscar membros da classe: {error_details}")
         
         if interaction.response.is_done():
             await interaction.followup.send(
@@ -1677,12 +2561,12 @@ async def enviar_dm(interaction: discord.Interaction, usuario: discord.Member, m
     """Envia uma DM para um usuário (apenas administradores)"""
     try:
         embed = discord.Embed(
-            title="📨 Mensagem do Bot",
+            title="📨 Mensagem da Staff",
             description=mensagem,
             color=discord.Color.blue(),
             timestamp=discord.utils.utcnow()
         )
-        embed.set_footer(text=f"Enviado por {interaction.user.display_name}")
+        embed.set_footer(text="Staff Mouz")
         
         await usuario.send(embed=embed)
         
@@ -1938,7 +2822,7 @@ async def lista(interaction: discord.Interaction, sala: str, nome_lista: str):
     except Exception as e:
         import traceback
         error_details = traceback.format_exc()
-        print(f"Erro ao criar lista: {error_details}")
+        logger.error(f"Erro ao criar lista: {error_details}")
         
         if interaction.response.is_done():
             await interaction.followup.send(
@@ -2030,7 +2914,7 @@ async def mover_sala(interaction: discord.Interaction, sala_origem: str, sala_de
                 failed_members.append((member, str(e)))
             except Exception as e:
                 failed_members.append((member, str(e)))
-                print(f"Erro ao mover {member.display_name}: {str(e)}")
+                logger.warning(f"Erro ao mover {member.display_name} (ID: {member.id}): {str(e)}")
         
         # Criar embed com resultado
         embed = discord.Embed(
@@ -2098,7 +2982,7 @@ async def mover_sala(interaction: discord.Interaction, sala_origem: str, sala_de
     except Exception as e:
         import traceback
         error_details = traceback.format_exc()
-        print(f"Erro ao mover membros: {error_details}")
+        logger.error(f"Erro ao mover membros: {error_details}")
         
         if interaction.response.is_done():
             await interaction.followup.send(
@@ -2219,8 +3103,8 @@ async def dm_cargo(interaction: discord.Interaction, cargos: str, mensagem: str,
         if image_url:
             embed.set_image(url=image_url)
         
-        # Footer nas DMs sempre mostra "Staff MOUZ"
-        embed.set_footer(text="Staff MOUZ")
+        # Footer nas DMs sempre mostra "Staff Mouz"
+        embed.set_footer(text="Staff Mouz")
         
         sent = 0
         failed = 0
@@ -2247,7 +3131,7 @@ async def dm_cargo(interaction: discord.Interaction, cargos: str, mensagem: str,
             except Exception as e:
                 failed += 1
                 blocked_members.append(member)
-                print(f"Erro ao enviar DM para {member.display_name}: {str(e)}")
+                logger.warning(f"Erro ao enviar DM para {member.display_name} (ID: {member.id}): {str(e)}")
         
         # Criar relatório detalhado
         role_mentions = ', '.join([role.mention for role in roles])
@@ -2475,7 +3359,7 @@ async def dm_cargo(interaction: discord.Interaction, cargos: str, mensagem: str,
                         await report_channel.send(embed=failed_embed)
                         
         except Exception as e:
-            print(f"Erro ao enviar relatório no canal: {str(e)}")
+            logger.error(f"Erro ao enviar relatório no canal (ID: {DM_REPORT_CHANNEL_ID}): {str(e)}")
     except Exception as e:
         await interaction.followup.send(
             f"❌ Erro ao enviar DMs: {str(e)}",
@@ -2760,7 +3644,7 @@ async def admin_progresso_player(interaction: discord.Interaction, usuario: disc
     except Exception as e:
         import traceback
         error_details = traceback.format_exc()
-        print(f"Erro ao buscar histórico: {error_details}")
+        logger.error(f"Erro ao buscar histórico: {error_details}")
         
         # Verificar se já respondeu
         if interaction.response.is_done():
@@ -2846,7 +3730,7 @@ async def admin_progresso_player(interaction: discord.Interaction, usuario: disc
     except Exception as e:
         import traceback
         error_details = traceback.format_exc()
-        print(f"Erro ao buscar histórico: {error_details}")
+        logger.error(f"Erro ao buscar histórico: {error_details}")
         
         # Verificar se já respondeu
         if interaction.response.is_done():
@@ -3164,7 +4048,7 @@ async def admin_membros_sem_registro(interaction: discord.Interaction):
     except Exception as e:
         import traceback
         error_details = traceback.format_exc()
-        print(f"Erro ao buscar membros sem registro: {error_details}")
+        logger.error(f"Erro ao buscar membros sem registro: {error_details}")
         
         if interaction.response.is_done():
             await interaction.followup.send(
@@ -3177,10 +4061,222 @@ async def admin_membros_sem_registro(interaction: discord.Interaction):
                 ephemeral=True
             )
 
+@bot.tree.command(name="admin_enviar_lembretes", description="[ADMIN] Envia lembretes de atualização de GS manualmente")
+@app_commands.default_permissions(administrator=True)
+async def admin_enviar_lembretes(interaction: discord.Interaction):
+    """Envia lembretes de atualização de GS manualmente (apenas administradores)"""
+    if not interaction.user.guild_permissions.administrator:
+        await interaction.response.send_message(
+            "❌ Apenas administradores podem usar este comando!",
+            ephemeral=True
+        )
+        return
+    
+    try:
+        await interaction.response.defer(ephemeral=True)
+        
+        reminders_sent, errors = await check_gs_update_reminders(interaction.guild)
+        
+        embed = discord.Embed(
+            title="📤 Lembretes de Atualização de GS Enviados",
+            description=f"Foram verificados os membros que não atualizaram há mais de **{GS_UPDATE_REMINDER_DAYS} dias**.",
+            color=discord.Color.green() if errors == 0 else discord.Color.orange(),
+            timestamp=discord.utils.utcnow()
+        )
+        
+        embed.add_field(name="✅ Lembretes Enviados", value=f"**{reminders_sent}**", inline=True)
+        embed.add_field(name="❌ Erros", value=f"**{errors}**", inline=True)
+        embed.add_field(name="📅 Dias sem atualizar", value=f"**{GS_UPDATE_REMINDER_DAYS}+**", inline=True)
+        
+        embed.set_footer(text=f"Executado por {interaction.user.display_name}")
+        await interaction.followup.send(embed=embed, ephemeral=True)
+        
+        logger.info(f"Lembretes de GS enviados manualmente por {interaction.user.display_name} (ID: {interaction.user.id}): {reminders_sent} enviados, {errors} erros")
+        
+    except Exception as e:
+        import traceback
+        error_details = traceback.format_exc()
+        logger.error(f"Erro ao enviar lembretes manualmente: {error_details}")
+        
+        if interaction.response.is_done():
+            await interaction.followup.send(
+                f"❌ Erro ao enviar lembretes: {str(e)}",
+                ephemeral=True
+            )
+        else:
+            await interaction.response.send_message(
+                f"❌ Erro ao enviar lembretes: {str(e)}",
+                ephemeral=True
+            )
+
+@bot.tree.command(name="admin_gs_desatualizados", description="[ADMIN] Lista membros com GS desatualizado")
+@app_commands.describe(
+    dias="Número de dias sem atualizar (padrão: configuração do bot)"
+)
+@app_commands.default_permissions(administrator=True)
+async def admin_gs_desatualizados(interaction: discord.Interaction, dias: int = None):
+    """Lista membros que não atualizaram GS há X dias (apenas administradores)"""
+    if not interaction.user.guild_permissions.administrator:
+        await interaction.response.send_message(
+            "❌ Apenas administradores podem usar este comando!",
+            ephemeral=True
+        )
+        return
+    
+    if dias is None:
+        dias = GS_UPDATE_REMINDER_DAYS
+    
+    try:
+        await interaction.response.defer(ephemeral=True)
+        
+        # Buscar todos os membros com cargo da guilda
+        guild_member_ids = await get_guild_member_ids(interaction.guild)
+        
+        if not guild_member_ids:
+            await interaction.followup.send(
+                "❌ Nenhum membro com o cargo da guilda encontrado!",
+                ephemeral=True
+            )
+            return
+        
+        # Buscar todos os registros do banco
+        all_registered = db.get_all_gearscores(valid_user_ids=guild_member_ids)
+        
+        # Data limite para considerar desatualizado
+        now = datetime.now()
+        limit_date = now - timedelta(days=dias)
+        
+        outdated_members = []
+        
+        for record in all_registered:
+            try:
+                # Extrair dados do registro
+                if isinstance(record, dict):
+                    user_id = record.get('user_id', '')
+                    family_name = record.get('family_name', 'N/A')
+                    class_pvp = record.get('class_pvp', 'N/A')
+                    ap = record.get('ap', 0)
+                    aap = record.get('aap', 0)
+                    dp = record.get('dp', 0)
+                    updated_at = record.get('updated_at')
+                else:
+                    user_id = str(record[1]) if len(record) > 1 else ''
+                    family_name = record[2] if len(record) > 2 else 'N/A'
+                    class_pvp = record[3] if len(record) > 3 else 'N/A'
+                    ap = record[4] if len(record) > 4 else 0
+                    aap = record[5] if len(record) > 5 else 0
+                    dp = record[6] if len(record) > 6 else 0
+                    updated_at = record[8] if len(record) > 8 else None
+                
+                if not user_id or not updated_at:
+                    continue
+                
+                # Converter updated_at para datetime
+                if isinstance(updated_at, str):
+                    for fmt in ['%Y-%m-%d %H:%M:%S', '%Y-%m-%d %H:%M:%S.%f', '%Y-%m-%dT%H:%M:%S', '%Y-%m-%dT%H:%M:%S.%f']:
+                        try:
+                            updated_datetime = datetime.strptime(updated_at.split('+')[0].split('Z')[0], fmt)
+                            break
+                        except:
+                            continue
+                    else:
+                        continue
+                elif hasattr(updated_at, 'replace'):
+                    updated_datetime = updated_at.replace(tzinfo=None) if updated_at.tzinfo else updated_at
+                else:
+                    continue
+                
+                # Verificar se está desatualizado
+                if updated_datetime >= limit_date:
+                    continue
+                
+                days_since_update = (now - updated_datetime).days
+                
+                member = interaction.guild.get_member(int(user_id))
+                if not member or not has_guild_role(member):
+                    continue
+                
+                gs_total = calculate_gs(ap, aap, dp)
+                outdated_members.append({
+                    'member': member,
+                    'family_name': family_name,
+                    'class_pvp': class_pvp,
+                    'gs': gs_total,
+                    'days': days_since_update,
+                    'last_update': updated_datetime
+                })
+                
+            except Exception as e:
+                continue
+        
+        # Ordenar por dias (mais tempo sem atualizar primeiro)
+        outdated_members.sort(key=lambda x: x['days'], reverse=True)
+        
+        # Criar embed
+        embed = discord.Embed(
+            title=f"📋 Membros com GS Desatualizado ({dias}+ dias)",
+            description=f"Membros que não atualizaram o gearscore há mais de **{dias} dias**.",
+            color=discord.Color.orange(),
+            timestamp=discord.utils.utcnow()
+        )
+        
+        if not outdated_members:
+            embed.add_field(
+                name="✅ Todos Atualizados",
+                value=f"Nenhum membro está com GS desatualizado há mais de {dias} dias!",
+                inline=False
+            )
+        else:
+            # Criar lista de membros (limitada para caber no embed)
+            members_list = ""
+            for i, m in enumerate(outdated_members[:20], 1):
+                members_list += f"**{i}.** {m['member'].mention} - {m['family_name']} ({m['class_pvp']}) - **{m['gs']}** GS - {m['days']} dias\n"
+            
+            if len(outdated_members) > 20:
+                members_list += f"\n... e mais {len(outdated_members) - 20} membro(s)"
+            
+            embed.add_field(
+                name=f"🚫 Membros Desatualizados ({len(outdated_members)})",
+                value=members_list[:1024],
+                inline=False
+            )
+            
+            embed.add_field(
+                name="📊 Estatísticas",
+                value=f"**Total desatualizados:** {len(outdated_members)}\n"
+                      f"**Total com registro:** {len(all_registered)}\n"
+                      f"**Maior tempo sem atualizar:** {outdated_members[0]['days']} dias" if outdated_members else "N/A",
+                inline=False
+            )
+        
+        embed.set_footer(text=f"Consulta executada por {interaction.user.display_name}")
+        await interaction.followup.send(embed=embed, ephemeral=True)
+        
+    except Exception as e:
+        import traceback
+        error_details = traceback.format_exc()
+        logger.error(f"Erro ao buscar GS desatualizados: {error_details}")
+        
+        if interaction.response.is_done():
+            await interaction.followup.send(
+                f"❌ Erro ao buscar membros desatualizados: {str(e)}",
+                ephemeral=True
+            )
+        else:
+            await interaction.response.send_message(
+                f"❌ Erro ao buscar membros desatualizados: {str(e)}",
+                ephemeral=True
+            )
+
 if __name__ == "__main__":
     if not DISCORD_TOKEN:
-        print("❌ Erro: DISCORD_TOKEN não encontrado no arquivo .env")
-        print("Por favor, crie um arquivo .env com DISCORD_TOKEN=seu_token_aqui")
+        logger.critical("❌ Erro: DISCORD_TOKEN não encontrado no arquivo .env")
+        logger.critical("Por favor, crie um arquivo .env com DISCORD_TOKEN=seu_token_aqui")
     else:
-        bot.run(DISCORD_TOKEN)
+        logger.info("Iniciando bot...")
+        try:
+            bot.run(DISCORD_TOKEN)
+        except Exception as e:
+            logger.critical(f"Erro fatal ao iniciar bot: {e}")
+            raise
 
