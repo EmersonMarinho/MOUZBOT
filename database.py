@@ -185,14 +185,17 @@ class Database:
         conn = self.get_connection()
         cursor = conn.cursor()
         
+        # Usar colunas explícitas para garantir ordem consistente
         if class_pvp:
             cursor.execute('''
-                SELECT * FROM gearscore 
+                SELECT id, user_id, family_name, character_name, class_pvp, ap, aap, dp, linkgear, updated_at
+                FROM gearscore 
                 WHERE user_id = ? AND class_pvp = ?
             ''', (user_id, class_pvp))
         else:
             cursor.execute('''
-                SELECT * FROM gearscore 
+                SELECT id, user_id, family_name, character_name, class_pvp, ap, aap, dp, linkgear, updated_at
+                FROM gearscore 
                 WHERE user_id = ?
                 ORDER BY updated_at DESC
             ''', (user_id,))
@@ -227,17 +230,21 @@ class Database:
         conn = self.get_connection()
         cursor = conn.cursor()
         
+        # Usar colunas explícitas para garantir ordem consistente
+        # (importante porque ALTER TABLE ADD COLUMN adiciona no final)
         if valid_user_ids:
             placeholders = ','.join(['?'] * len(valid_user_ids))
             query = f'''
-                SELECT * FROM gearscore 
+                SELECT id, user_id, family_name, character_name, class_pvp, ap, aap, dp, linkgear, updated_at
+                FROM gearscore 
                 WHERE user_id IN ({placeholders})
                 ORDER BY updated_at DESC
             '''
             cursor.execute(query, list(valid_user_ids))
         else:
             cursor.execute('''
-                SELECT * FROM gearscore 
+                SELECT id, user_id, family_name, character_name, class_pvp, ap, aap, dp, linkgear, updated_at
+                FROM gearscore 
                 ORDER BY updated_at DESC
             ''')
         
@@ -303,17 +310,20 @@ class Database:
         conn = self.get_connection()
         cursor = conn.cursor()
         
+        # Usar colunas explícitas para garantir ordem consistente
         if valid_user_ids:
             placeholders = ','.join(['?'] * len(valid_user_ids))
             query = f'''
-                SELECT * FROM gearscore 
+                SELECT id, user_id, family_name, character_name, class_pvp, ap, aap, dp, linkgear, updated_at
+                FROM gearscore 
                 WHERE class_pvp = ? AND user_id IN ({placeholders})
                 ORDER BY (CASE WHEN ap > aap THEN ap ELSE aap END + dp) DESC
             '''
             cursor.execute(query, [class_pvp] + list(valid_user_ids))
         else:
             cursor.execute('''
-                SELECT * FROM gearscore 
+                SELECT id, user_id, family_name, character_name, class_pvp, ap, aap, dp, linkgear, updated_at
+                FROM gearscore 
                 WHERE class_pvp = ?
                 ORDER BY (CASE WHEN ap > aap THEN ap ELSE aap END + dp) DESC
             ''', (class_pvp,))

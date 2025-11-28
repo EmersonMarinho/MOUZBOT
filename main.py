@@ -163,13 +163,14 @@ async def check_gs_update_reminders(guild: discord.Guild):
                 dp = record.get('dp', 0)
                 updated_at = record.get('updated_at')
             else:
+                # Ordem das colunas: id(0), user_id(1), family_name(2), character_name(3), class_pvp(4), ap(5), aap(6), dp(7), linkgear(8), updated_at(9)
                 user_id = str(record[1]) if len(record) > 1 else ''
                 family_name = record[2] if len(record) > 2 else 'N/A'
-                class_pvp = record[3] if len(record) > 3 else 'N/A'
-                ap = record[4] if len(record) > 4 else 0
-                aap = record[5] if len(record) > 5 else 0
-                dp = record[6] if len(record) > 6 else 0
-                updated_at = record[8] if len(record) > 8 else None
+                class_pvp = record[4] if len(record) > 4 else 'N/A'
+                ap = record[5] if len(record) > 5 else 0
+                aap = record[6] if len(record) > 6 else 0
+                dp = record[7] if len(record) > 7 else 0
+                updated_at = record[9] if len(record) > 9 else None
             
             if not user_id or not updated_at:
                 continue
@@ -1056,15 +1057,15 @@ async def generate_profile_embed(interaction: discord.Interaction, target_user: 
         linkgear = result.get('linkgear', 'N/A')
         updated_at = result.get('updated_at', 'N/A')
     else:
-        # SQLite/PostgreSQL: id, user_id, family_name, class_pvp, ap, aap, dp, linkgear, updated_at
+        # Ordem das colunas: id(0), user_id(1), family_name(2), character_name(3), class_pvp(4), ap(5), aap(6), dp(7), linkgear(8), updated_at(9)
         family_name = result[2] if len(result) > 2 else 'N/A'
-        character_name = family_name
-        class_pvp = result[3] if len(result) > 3 else 'N/A'
-        ap = result[4] if len(result) > 4 else 0
-        aap = result[5] if len(result) > 5 else 0
-        dp = result[6] if len(result) > 6 else 0
-        linkgear = result[7] if len(result) > 7 else 'N/A'
-        updated_at = result[8] if len(result) > 8 else 'N/A'
+        character_name = result[3] if len(result) > 3 else family_name
+        class_pvp = result[4] if len(result) > 4 else 'N/A'
+        ap = result[5] if len(result) > 5 else 0
+        aap = result[6] if len(result) > 6 else 0
+        dp = result[7] if len(result) > 7 else 0
+        linkgear = result[8] if len(result) > 8 else 'N/A'
+        updated_at = result[9] if len(result) > 9 else 'N/A'
     
     gs_total = calculate_gs(ap, aap, dp)
     
@@ -1115,9 +1116,10 @@ async def generate_profile_embed(interaction: discord.Interaction, target_user: 
             aap_val = result.get('aap', 0)
             dp_val = result.get('dp', 0)
         else:
-            ap_val = result[4] if len(result) > 4 else 0
-            aap_val = result[5] if len(result) > 5 else 0
-            dp_val = result[6] if len(result) > 6 else 0
+            # Ordem das colunas: id(0), user_id(1), family_name(2), character_name(3), class_pvp(4), ap(5), aap(6), dp(7), linkgear(8), updated_at(9)
+            ap_val = result[5] if len(result) > 5 else 0
+            aap_val = result[6] if len(result) > 6 else 0
+            dp_val = result[7] if len(result) > 7 else 0
         return calculate_gs(ap_val, aap_val, dp_val)
     
     sorted_gearscores = sorted(all_gearscores, key=get_gs_from_result, reverse=True)
@@ -1805,10 +1807,24 @@ class ClassStatsSelect(discord.ui.Select):
     async def callback(self, interaction: discord.Interaction):
         selected_class = self.values[0]
         
+        # DEBUG: Log para verificar o que está acontecendo
+        logger.info(f"[DEBUG] Classe selecionada: '{selected_class}'")
+        logger.info(f"[DEBUG] valid_user_ids count: {len(self.valid_user_ids) if self.valid_user_ids else 0}")
+        
         # Buscar membros da classe
         all_gearscores = db.get_all_gearscores(valid_user_ids=self.valid_user_ids)
         
+        # DEBUG: Log dos dados retornados
+        logger.info(f"[DEBUG] Total de registros retornados: {len(all_gearscores) if all_gearscores else 0}")
+        if all_gearscores and len(all_gearscores) > 0:
+            sample = all_gearscores[0]
+            logger.info(f"[DEBUG] Tipo do registro: {type(sample)}")
+            logger.info(f"[DEBUG] Tamanho do registro: {len(sample) if hasattr(sample, '__len__') else 'N/A'}")
+            if not isinstance(sample, dict):
+                logger.info(f"[DEBUG] Registro completo: {sample}")
+        
         class_members = []
+        classes_found = set()  # DEBUG: Para coletar todas as classes encontradas
         for record in all_gearscores:
             if isinstance(record, dict):
                 class_pvp = record.get('class_pvp', '')
@@ -1827,11 +1843,18 @@ class ClassStatsSelect(discord.ui.Select):
                 dp = record[7] if len(record) > 7 else 0
                 linkgear = record[8] if len(record) > 8 else ''
             
-            if class_pvp == selected_class:
+            classes_found.add(str(class_pvp))  # DEBUG
+            
+            # Comparação case-insensitive e com strip para evitar problemas
+            if str(class_pvp).strip().lower() == str(selected_class).strip().lower():
                 gs_total = max(int(ap or 0), int(aap or 0)) + int(dp or 0)
                 member = self.guild.get_member(int(user_id)) if user_id else None
                 display_name = member.display_name if member else "Desconhecido"
                 class_members.append((family_name, display_name, gs_total, ap, aap, dp, user_id, linkgear))
+        
+        # DEBUG: Log das classes encontradas
+        logger.info(f"[DEBUG] Classes encontradas nos dados: {classes_found}")
+        logger.info(f"[DEBUG] Total de membros encontrados para '{selected_class}': {len(class_members)}")
         
         # Ordenar por GS
         class_members.sort(key=lambda x: x[2], reverse=True)
@@ -2351,9 +2374,10 @@ async def ranking_gearscore(interaction: discord.Interaction):
                 aap = result.get('aap', 0)
                 dp = result.get('dp', 0)
             else:
-                ap = result[4] if len(result) > 4 else 0
-                aap = result[5] if len(result) > 5 else 0
-                dp = result[6] if len(result) > 6 else 0
+                # Ordem das colunas: id(0), user_id(1), family_name(2), character_name(3), class_pvp(4), ap(5), aap(6), dp(7), linkgear(8), updated_at(9)
+                ap = result[5] if len(result) > 5 else 0
+                aap = result[6] if len(result) > 6 else 0
+                dp = result[7] if len(result) > 7 else 0
             return calculate_gs(ap, aap, dp)
         
         sorted_results = sorted(results, key=get_gs_from_result, reverse=True)
@@ -2373,12 +2397,12 @@ async def ranking_gearscore(interaction: discord.Interaction):
                 aap = result.get('aap', 0)
                 dp = result.get('dp', 0)
             else:
-                # SQLite/PostgreSQL: id, user_id, family_name, class_pvp, ap, aap, dp, linkgear, updated_at
+                # Ordem das colunas: id(0), user_id(1), family_name(2), character_name(3), class_pvp(4), ap(5), aap(6), dp(7), linkgear(8), updated_at(9)
                 family_name = result[2] if len(result) > 2 else 'N/A'
-                class_pvp = result[3] if len(result) > 3 else 'N/A'
-                ap = result[4] if len(result) > 4 else 0
-                aap = result[5] if len(result) > 5 else 0
-                dp = result[6] if len(result) > 6 else 0
+                class_pvp = result[4] if len(result) > 4 else 'N/A'
+                ap = result[5] if len(result) > 5 else 0
+                aap = result[6] if len(result) > 6 else 0
+                dp = result[7] if len(result) > 7 else 0
             
             gearscore_total = calculate_gs(ap, aap, dp)
             info = f"**{family_name}**\n"
@@ -2455,9 +2479,10 @@ async def membros_classe(interaction: discord.Interaction, classe: str):
                 aap = member.get('aap', 0)
                 dp = member.get('dp', 0)
             else:
-                ap = member[4] if len(member) > 4 else 0
-                aap = member[5] if len(member) > 5 else 0
-                dp = member[6] if len(member) > 6 else 0
+                # Ordem das colunas: id(0), user_id(1), family_name(2), character_name(3), class_pvp(4), ap(5), aap(6), dp(7), linkgear(8), updated_at(9)
+                ap = member[5] if len(member) > 5 else 0
+                aap = member[6] if len(member) > 6 else 0
+                dp = member[7] if len(member) > 7 else 0
             return calculate_gs(ap, aap, dp)
         
         sorted_members = sorted(members, key=get_gs_from_member, reverse=True)
@@ -2481,13 +2506,13 @@ async def membros_classe(interaction: discord.Interaction, classe: str):
                 linkgear = member.get('linkgear', 'N/A')
                 updated_at = member.get('updated_at', 'N/A')
             else:
-                # SQLite/PostgreSQL: id, user_id, family_name, class_pvp, ap, aap, dp, linkgear, updated_at
+                # Ordem das colunas: id(0), user_id(1), family_name(2), character_name(3), class_pvp(4), ap(5), aap(6), dp(7), linkgear(8), updated_at(9)
                 family_name = member[2] if len(member) > 2 else 'N/A'
-                ap = member[4] if len(member) > 4 else 0
-                aap = member[5] if len(member) > 5 else 0
-                dp = member[6] if len(member) > 6 else 0
-                linkgear = member[7] if len(member) > 7 else 'N/A'
-                updated_at = member[8] if len(member) > 8 else 'N/A'
+                ap = member[5] if len(member) > 5 else 0
+                aap = member[6] if len(member) > 6 else 0
+                dp = member[7] if len(member) > 7 else 0
+                linkgear = member[8] if len(member) > 8 else 'N/A'
+                updated_at = member[9] if len(member) > 9 else 'N/A'
             
             gs_total = calculate_gs(ap, aap, dp)
             
@@ -2618,13 +2643,14 @@ async def gearscore_dm(interaction: discord.Interaction):
             linkgear = result.get('linkgear', 'N/A')
             updated_at = result.get('updated_at', 'N/A')
         else:
+            # Ordem das colunas: id(0), user_id(1), family_name(2), character_name(3), class_pvp(4), ap(5), aap(6), dp(7), linkgear(8), updated_at(9)
             family_name = result[2] if len(result) > 2 else 'N/A'
-            class_pvp = result[3] if len(result) > 3 else 'N/A'
-            ap = result[4] if len(result) > 4 else 0
-            aap = result[5] if len(result) > 5 else 0
-            dp = result[6] if len(result) > 6 else 0
-            linkgear = result[7] if len(result) > 7 else 'N/A'
-            updated_at = result[8] if len(result) > 8 else 'N/A'
+            class_pvp = result[4] if len(result) > 4 else 'N/A'
+            ap = result[5] if len(result) > 5 else 0
+            aap = result[6] if len(result) > 6 else 0
+            dp = result[7] if len(result) > 7 else 0
+            linkgear = result[8] if len(result) > 8 else 'N/A'
+            updated_at = result[9] if len(result) > 9 else 'N/A'
         
         gs_total = calculate_gs(ap, aap, dp)
         embed = discord.Embed(
@@ -3424,11 +3450,11 @@ async def admin_lista_classe(interaction: discord.Interaction, classe: str):
                 aap = int(member.get('aap', 0) or 0)
                 dp = int(member.get('dp', 0) or 0)
             else:
-                # SQLite/PostgreSQL: id, user_id, family_name, class_pvp, ap, aap, dp, linkgear, updated_at
+                # Ordem das colunas: id(0), user_id(1), family_name(2), character_name(3), class_pvp(4), ap(5), aap(6), dp(7), linkgear(8), updated_at(9)
                 family = member[2] if len(member) > 2 else 'N/A'
-                ap = int(member[4] or 0) if len(member) > 4 else 0
-                aap = int(member[5] or 0) if len(member) > 5 else 0
-                dp = int(member[6] or 0) if len(member) > 6 else 0
+                ap = int(member[5] or 0) if len(member) > 5 else 0
+                aap = int(member[6] or 0) if len(member) > 6 else 0
+                dp = int(member[7] or 0) if len(member) > 7 else 0
             
             total_gs = calculate_gs(ap, aap, dp)
             embed.add_field(
@@ -3795,10 +3821,10 @@ async def analise_classe(interaction: discord.Interaction, classe: str):
                 aap = int(member.get('aap', 0) or 0)
                 dp = int(member.get('dp', 0) or 0)
             else:
-                # SQLite/PostgreSQL: id, user_id, family_name, class_pvp, ap, aap, dp, linkgear, updated_at
-                ap = int(member[4] or 0) if len(member) > 4 else 0
-                aap = int(member[5] or 0) if len(member) > 5 else 0
-                dp = int(member[6] or 0) if len(member) > 6 else 0
+                # Ordem das colunas: id(0), user_id(1), family_name(2), character_name(3), class_pvp(4), ap(5), aap(6), dp(7), linkgear(8), updated_at(9)
+                ap = int(member[5] or 0) if len(member) > 5 else 0
+                aap = int(member[6] or 0) if len(member) > 6 else 0
+                dp = int(member[7] or 0) if len(member) > 7 else 0
             
             total_ap += ap
             total_aap += aap
@@ -3836,11 +3862,11 @@ async def analise_classe(interaction: discord.Interaction, classe: str):
                 dp = int(member.get('dp', 0) or 0)
                 gs = calculate_gs(ap, aap, dp)
             else:
-                # SQLite/PostgreSQL: id, user_id, family_name, class_pvp, ap, aap, dp, linkgear, updated_at
+                # Ordem das colunas: id(0), user_id(1), family_name(2), character_name(3), class_pvp(4), ap(5), aap(6), dp(7), linkgear(8), updated_at(9)
                 family_name = member[2] if len(member) > 2 else 'N/A'
-                ap = int(member[4] or 0) if len(member) > 4 else 0
-                aap = int(member[5] or 0) if len(member) > 5 else 0
-                dp = int(member[6] or 0) if len(member) > 6 else 0
+                ap = int(member[5] or 0) if len(member) > 5 else 0
+                aap = int(member[6] or 0) if len(member) > 6 else 0
+                dp = int(member[7] or 0) if len(member) > 7 else 0
                 gs = calculate_gs(ap, aap, dp)
             
             medal = "🥇" if i == 1 else "🥈" if i == 2 else "🥉" if i == 3 else f"#{i}"
@@ -3859,9 +3885,10 @@ async def analise_classe(interaction: discord.Interaction, classe: str):
                 aap = int(member.get('aap', 0) or 0)
                 dp = int(member.get('dp', 0) or 0)
             else:
-                ap = int(member[4] or 0) if len(member) > 4 else 0
-                aap = int(member[5] or 0) if len(member) > 5 else 0
-                dp = int(member[6] or 0) if len(member) > 6 else 0
+                # Ordem das colunas: id(0), user_id(1), family_name(2), character_name(3), class_pvp(4), ap(5), aap(6), dp(7), linkgear(8), updated_at(9)
+                ap = int(member[5] or 0) if len(member) > 5 else 0
+                aap = int(member[6] or 0) if len(member) > 6 else 0
+                dp = int(member[7] or 0) if len(member) > 7 else 0
             return calculate_gs(ap, aap, dp)
         
         sorted_members = sorted(members, key=get_gs_from_member, reverse=True)
@@ -3899,12 +3926,12 @@ async def analise_classe(interaction: discord.Interaction, classe: str):
                     dp = int(member.get('dp', 0) or 0)
                     linkgear = member.get('linkgear', 'N/A')
                 else:
-                    # SQLite/PostgreSQL: id, user_id, family_name, class_pvp, ap, aap, dp, linkgear, updated_at
+                    # Ordem das colunas: id(0), user_id(1), family_name(2), character_name(3), class_pvp(4), ap(5), aap(6), dp(7), linkgear(8), updated_at(9)
                     family_name = member[2] if len(member) > 2 else 'N/A'
-                    ap = int(member[4] or 0) if len(member) > 4 else 0
-                    aap = int(member[5] or 0) if len(member) > 5 else 0
-                    dp = int(member[6] or 0) if len(member) > 6 else 0
-                    linkgear = member[7] if len(member) > 7 else 'N/A'
+                    ap = int(member[5] or 0) if len(member) > 5 else 0
+                    aap = int(member[6] or 0) if len(member) > 6 else 0
+                    dp = int(member[7] or 0) if len(member) > 7 else 0
+                    linkgear = member[8] if len(member) > 8 else 'N/A'
                 
                 gs_total = calculate_gs(ap, aap, dp)
                 position = embed_idx + i
@@ -3978,7 +4005,7 @@ async def admin_membros_sem_registro(interaction: discord.Interaction):
             if isinstance(record, dict):
                 user_id = record.get('user_id', '')
             else:
-                # SQLite/PostgreSQL: id, user_id, family_name, class_pvp, ap, aap, dp, linkgear, updated_at
+                # Ordem das colunas: id(0), user_id(1), family_name(2), character_name(3), class_pvp(4), ap(5), aap(6), dp(7), linkgear(8), updated_at(9)
                 user_id = record[1] if len(record) > 1 else ''
             
             if user_id:
@@ -4160,13 +4187,14 @@ async def admin_gs_desatualizados(interaction: discord.Interaction, dias: int = 
                     dp = record.get('dp', 0)
                     updated_at = record.get('updated_at')
                 else:
+                    # Ordem das colunas: id(0), user_id(1), family_name(2), character_name(3), class_pvp(4), ap(5), aap(6), dp(7), linkgear(8), updated_at(9)
                     user_id = str(record[1]) if len(record) > 1 else ''
                     family_name = record[2] if len(record) > 2 else 'N/A'
-                    class_pvp = record[3] if len(record) > 3 else 'N/A'
-                    ap = record[4] if len(record) > 4 else 0
-                    aap = record[5] if len(record) > 5 else 0
-                    dp = record[6] if len(record) > 6 else 0
-                    updated_at = record[8] if len(record) > 8 else None
+                    class_pvp = record[4] if len(record) > 4 else 'N/A'
+                    ap = record[5] if len(record) > 5 else 0
+                    aap = record[6] if len(record) > 6 else 0
+                    dp = record[7] if len(record) > 7 else 0
+                    updated_at = record[9] if len(record) > 9 else None
                 
                 if not user_id or not updated_at:
                     continue

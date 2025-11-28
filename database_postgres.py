@@ -394,15 +394,16 @@ class Database:
         conn = self.get_connection()
         cursor = conn.cursor()
         
+        # Usar colunas explícitas para garantir ordem consistente
         if class_pvp:
             cursor.execute('''
-                SELECT id, user_id, family_name, class_pvp, ap, aap, dp, linkgear, updated_at
+                SELECT id, user_id, family_name, character_name, class_pvp, ap, aap, dp, linkgear, updated_at
                 FROM gearscore 
                 WHERE user_id = %s AND class_pvp = %s
             ''', (user_id, class_pvp))
         else:
             cursor.execute('''
-                SELECT id, user_id, family_name, class_pvp, ap, aap, dp, linkgear, updated_at
+                SELECT id, user_id, family_name, character_name, class_pvp, ap, aap, dp, linkgear, updated_at
                 FROM gearscore 
                 WHERE user_id = %s
                 ORDER BY updated_at DESC
@@ -519,10 +520,11 @@ class Database:
         conn = self.get_connection()
         cursor = conn.cursor()
         
+        # Usar colunas explícitas para garantir ordem consistente
         if valid_user_ids:
             placeholders = ','.join(['%s'] * len(valid_user_ids))
             query = f'''
-                SELECT id, user_id, family_name, class_pvp, ap, aap, dp, linkgear, updated_at
+                SELECT id, user_id, family_name, character_name, class_pvp, ap, aap, dp, linkgear, updated_at
                 FROM gearscore 
                 WHERE class_pvp = %s AND user_id IN ({placeholders})
                 ORDER BY (GREATEST(ap, aap) + dp) DESC
@@ -530,7 +532,7 @@ class Database:
             cursor.execute(query, [class_pvp] + list(valid_user_ids))
         else:
             cursor.execute('''
-                SELECT id, user_id, family_name, class_pvp, ap, aap, dp, linkgear, updated_at
+                SELECT id, user_id, family_name, character_name, class_pvp, ap, aap, dp, linkgear, updated_at
                 FROM gearscore 
                 WHERE class_pvp = %s
                 ORDER BY (GREATEST(ap, aap) + dp) DESC
