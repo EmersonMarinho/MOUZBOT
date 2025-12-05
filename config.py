@@ -24,6 +24,12 @@ MONGODB_DB_NAME = os.getenv('MONGODB_DB_NAME', 'bdo_gearscore')
 ALLOWED_DM_ROLES = os.getenv('ALLOWED_DM_ROLES', '').split(',') if os.getenv('ALLOWED_DM_ROLES') else []
 ALLOWED_DM_ROLES = [role_id.strip() for role_id in ALLOWED_DM_ROLES if role_id.strip()]
 
+# IDs de usuários que podem usar comandos de ADMIN (além dos administradores do servidor)
+# Exemplo: ADMIN_USER_IDS=123456789,987654321
+# Deixe vazio para permitir apenas administradores do servidor
+ADMIN_USER_IDS = os.getenv('ADMIN_USER_IDS', '').split(',') if os.getenv('ADMIN_USER_IDS') else []
+ADMIN_USER_IDS = [user_id.strip() for user_id in ADMIN_USER_IDS if user_id.strip()]
+
 # ID do canal para notificações de registro/atualização
 NOTIFICATION_CHANNEL_ID = 1442347196103004242
 
@@ -49,36 +55,39 @@ UNREGISTERED_ROLE_ID = 1442889439717359728
 GS_UPDATE_REMINDER_DAYS = 10  # Dias sem atualizar para enviar lembrete
 GS_REMINDER_CHECK_HOUR = 12  # Hora do dia para verificar (12 = meio-dia)
 
-# Lista de classes do Black Desert Online
+
+# Lista de classes do Black Desert Online (ordem alfabética)
+# Total: 30 classes - Discord mostra 25, usuário deve DIGITAR para filtrar
 BDO_CLASSES = [
-    "Warrior",
-    "Ranger",
-    "Feiticeira",
-    "Berserker",
-    "Valkyrie",
-    "Mago",
-    "Bruxa",
-    "Tamer",
-    "Musa",
-    "Maehwa",
-    "Ninja",
-    "Kunoichi",
-    "Mística",
-    "Striker",
-    "Lahn",
     "Arqueiro",
-    "Shai",
+    "Berserker",
+    "Bruxa",
+    "Corsair",
+    "Dark Knight",
+    "Deadeye",
+    "Dosa",
+    "Drakania",
+    "Feiticeira",
     "Guardian",
     "Hashashin",
-    "Nova",
-    "Sage",
-    "Corsair",
-    "Drakania",
-    "Woosa",
+    "Kunoichi",
+    "Lahn",
     "Maegu",
+    "Maehwa",
+    "Mago",
+    "Mística",
+    "Musa",
+    "Ninja",
+    "Nova",
+    "Ranger",
+    "Sage",
     "Scholar",
-    "Dosa",
-    "Deadeye",
+    "Shai",
+    "Striker",
+    "Tamer",
+    "Valkyrie",
+    "Warrior",
+    "Woosa",
     "Wukong"
 ]
 

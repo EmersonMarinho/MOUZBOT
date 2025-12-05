@@ -241,6 +241,54 @@ class Database:
             print(f"Aviso ao criar índice: {e}")
             conn.rollback()
         
+        # Tabela de eventos (GvG, Treino, etc)
+        try:
+            cursor.execute('''
+                CREATE TABLE IF NOT EXISTS eventos (
+                    id SERIAL PRIMARY KEY,
+                    tipo TEXT NOT NULL,
+                    nome TEXT NOT NULL,
+                    canal_voz TEXT,
+                    criado_por TEXT NOT NULL,
+                    criado_por_nome TEXT,
+                    created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                    mes_referencia TEXT NOT NULL
+                )
+            ''')
+        except Exception as e:
+            print(f"Aviso ao criar tabela eventos: {e}")
+            conn.rollback()
+        
+        # Tabela de participações em eventos
+        try:
+            cursor.execute('''
+                CREATE TABLE IF NOT EXISTS participacoes (
+                    id SERIAL PRIMARY KEY,
+                    evento_id INTEGER NOT NULL REFERENCES eventos(id),
+                    user_id TEXT NOT NULL,
+                    family_name TEXT,
+                    display_name TEXT,
+                    created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+                )
+            ''')
+        except Exception as e:
+            print(f"Aviso ao criar tabela participacoes: {e}")
+            conn.rollback()
+        
+        # Índices para performance
+        try:
+            cursor.execute('''
+                CREATE INDEX IF NOT EXISTS idx_eventos_mes 
+                ON eventos(mes_referencia, tipo)
+            ''')
+            cursor.execute('''
+                CREATE INDEX IF NOT EXISTS idx_participacoes_evento 
+                ON participacoes(evento_id, user_id)
+            ''')
+        except Exception as e:
+            print(f"Aviso ao criar índices de eventos: {e}")
+            conn.rollback()
+        
         try:
             conn.commit()
         except Exception as e:
@@ -651,4 +699,285 @@ class Database:
             cursor.close()
             conn.close()
             return False, f"Erro ao limpar histórico: {str(e)}"
+    
+    def delete_user_gearscore(self, user_id):
+        """Deleta o registro de gearscore de um usuário específico"""
+        conn = self.get_connection()
+        cursor = conn.cursor()
+        
+        try:
+            # Verificar se o usuário tem registro
+            cursor.execute('SELECT family_name, class_pvp FROM gearscore WHERE user_id = %s', (user_id,))
+            result = cursor.fetchone()
+            
+            if not result:
+                cursor.close()
+                conn.close()
+                return False, "Usuário não possui registro de gearscore."
+            
+            family_name, class_pvp = result
+            
+            # Deletar registro do gearscore
+            cursor.execute('DELETE FROM gearscore WHERE user_id = %s', (user_id,))
+            
+            # Deletar histórico do usuário
+            cursor.execute('DELETE FROM gearscore_history WHERE user_id = %s', (user_id,))
+            
+            conn.commit()
+            cursor.close()
+            conn.close()
+            return True, f"Registro de {family_name} ({class_pvp}) excluído com sucesso!"
+        except Exception as e:
+            conn.rollback()
+            cursor.close()
+            conn.close()
+            return False, f"Erro ao excluir registro: {str(e)}"
+    
+    def admin_update_gearscore(self, user_id, family_name=None, character_name=None, class_pvp=None, ap=None, aap=None, dp=None, linkgear=None):
+        """Atualiza o gearscore de um usuário (admin - força atualização mesmo se não existir)"""
+        conn = self.get_connection()
+        cursor = conn.cursor()
+        
+        try:
+            # Buscar dados atuais
+            cursor.execute('''
+                SELECT family_name, character_name, class_pvp, ap, aap, dp, linkgear 
+                FROM gearscore WHERE user_id = %s
+            ''', (user_id,))
+            current = cursor.fetchone()
+            
+            if not current:
+                cursor.close()
+                conn.close()
+                return False, "Usuário não possui registro de gearscore. Use /registro_manual primeiro."
+            
+            # Usar valores atuais se não fornecidos
+            current_family_name, current_character_name, current_class_pvp, current_ap, current_aap, current_dp, current_linkgear = current
+            
+            family_name = family_name if family_name is not None else current_family_name
+            character_name = character_name if character_name is not None else current_character_name
+            class_pvp = class_pvp if class_pvp is not None else current_class_pvp
+            ap = ap if ap is not None else current_ap
+            aap = aap if aap is not None else current_aap
+            dp = dp if dp is not None else current_dp
+            linkgear = linkgear if linkgear is not None else current_linkgear
+            
+            # Se mudou de classe, precisamos atualizar o registro corretamente
+            if class_pvp != current_class_pvp:
+                # Remover registro da classe antiga
+                cursor.execute('DELETE FROM gearscore WHERE user_id = %s', (user_id,))
+            
+            # Atualizar ou inserir gearscore
+            cursor.execute('''
+                INSERT INTO gearscore 
+                (user_id, family_name, character_name, class_pvp, ap, aap, dp, linkgear, updated_at)
+                VALUES (%s, %s, %s, %s, %s, %s, %s, %s, CURRENT_TIMESTAMP)
+                ON CONFLICT (user_id, class_pvp) 
+                DO UPDATE SET 
+                    family_name = EXCLUDED.family_name,
+                    character_name = EXCLUDED.character_name,
+                    ap = EXCLUDED.ap,
+                    aap = EXCLUDED.aap,
+                    dp = EXCLUDED.dp,
+                    linkgear = EXCLUDED.linkgear,
+                    updated_at = CURRENT_TIMESTAMP
+            ''', (user_id, family_name, character_name, class_pvp, ap, aap, dp, linkgear))
+            
+            # Salvar histórico
+            total_gs = max(ap, aap) + dp
+            cursor.execute('''
+                INSERT INTO gearscore_history 
+                (user_id, class_pvp, ap, aap, dp, total_gs, created_at)
+                VALUES (%s, %s, %s, %s, %s, %s, CURRENT_TIMESTAMP)
+            ''', (user_id, class_pvp, ap, aap, dp, total_gs))
+            
+            conn.commit()
+            cursor.close()
+            conn.close()
+            return True, f"Registro de {family_name} atualizado com sucesso! GS: {total_gs}"
+        except Exception as e:
+            conn.rollback()
+            cursor.close()
+            conn.close()
+            return False, f"Erro ao atualizar registro: {str(e)}"
+    
+    def get_gearscore_by_family_name(self, family_name):
+        """Busca o gearscore de um usuário pelo nome de família (case-insensitive)"""
+        conn = self.get_connection()
+        cursor = conn.cursor()
+        
+        cursor.execute('''
+            SELECT id, user_id, family_name, character_name, class_pvp, ap, aap, dp, linkgear, updated_at
+            FROM gearscore 
+            WHERE LOWER(family_name) = LOWER(%s)
+        ''', (family_name,))
+        
+        result = cursor.fetchone()
+        cursor.close()
+        conn.close()
+        return result
+    
+    def get_gearscores_by_family_names(self, family_names):
+        """Busca o gearscore de múltiplos usuários pelos nomes de família"""
+        conn = self.get_connection()
+        cursor = conn.cursor()
+        
+        results = {}
+        for name in family_names:
+            cursor.execute('''
+                SELECT id, user_id, family_name, character_name, class_pvp, ap, aap, dp, linkgear, updated_at
+                FROM gearscore 
+                WHERE LOWER(family_name) = LOWER(%s)
+            ''', (name.strip(),))
+            
+            result = cursor.fetchone()
+            if result:
+                results[name.strip().lower()] = result
+        
+        cursor.close()
+        conn.close()
+        return results
+    
+    # ============================================
+    # MÉTODOS PARA EVENTOS E PARTICIPAÇÕES
+    # ============================================
+    
+    def registrar_evento(self, tipo, nome, canal_voz, criado_por, criado_por_nome, participantes):
+        """
+        Registra um evento e suas participações.
+        participantes: lista de dicts com {user_id, family_name, display_name}
+        Retorna: (evento_id, quantidade_participantes)
+        """
+        conn = self.get_connection()
+        cursor = conn.cursor()
+        
+        try:
+            # Determinar mês de referência (formato: YYYY-MM)
+            from datetime import datetime
+            mes_referencia = datetime.now().strftime("%Y-%m")
+            
+            # Inserir evento
+            cursor.execute('''
+                INSERT INTO eventos (tipo, nome, canal_voz, criado_por, criado_por_nome, mes_referencia)
+                VALUES (%s, %s, %s, %s, %s, %s)
+                RETURNING id
+            ''', (tipo, nome, canal_voz, criado_por, criado_por_nome, mes_referencia))
+            
+            evento_id = cursor.fetchone()[0]
+            
+            # Inserir participações
+            for p in participantes:
+                cursor.execute('''
+                    INSERT INTO participacoes (evento_id, user_id, family_name, display_name)
+                    VALUES (%s, %s, %s, %s)
+                ''', (evento_id, p['user_id'], p.get('family_name'), p.get('display_name')))
+            
+            conn.commit()
+            cursor.close()
+            conn.close()
+            return evento_id, len(participantes)
+        except Exception as e:
+            conn.rollback()
+            cursor.close()
+            conn.close()
+            raise e
+    
+    def get_relatorio_participacoes(self, mes_referencia=None):
+        """
+        Retorna relatório de participações do mês.
+        Se mes_referencia for None, usa o mês atual.
+        Retorna: {
+            'eventos_por_tipo': {tipo: quantidade},
+            'participacoes_por_player': {user_id: {tipo: quantidade, 'display_name': nome}},
+            'total_eventos': int,
+            'mes': str
+        }
+        """
+        conn = self.get_connection()
+        cursor = conn.cursor()
+        
+        from datetime import datetime
+        if mes_referencia is None:
+            mes_referencia = datetime.now().strftime("%Y-%m")
+        
+        # Contar eventos por tipo
+        cursor.execute('''
+            SELECT tipo, COUNT(*) as total
+            FROM eventos
+            WHERE mes_referencia = %s
+            GROUP BY tipo
+        ''', (mes_referencia,))
+        
+        eventos_por_tipo = {}
+        for row in cursor.fetchall():
+            eventos_por_tipo[row[0]] = row[1]
+        
+        total_eventos = sum(eventos_por_tipo.values())
+        
+        # Contar participações por player e tipo
+        cursor.execute('''
+            SELECT p.user_id, p.display_name, p.family_name, e.tipo, COUNT(*) as total
+            FROM participacoes p
+            JOIN eventos e ON p.evento_id = e.id
+            WHERE e.mes_referencia = %s
+            GROUP BY p.user_id, p.display_name, p.family_name, e.tipo
+        ''', (mes_referencia,))
+        
+        participacoes_por_player = {}
+        for row in cursor.fetchall():
+            user_id = row[0]
+            display_name = row[1]
+            family_name = row[2]
+            tipo = row[3]
+            quantidade = row[4]
+            
+            if user_id not in participacoes_por_player:
+                participacoes_por_player[user_id] = {
+                    'display_name': display_name or family_name or user_id,
+                    'family_name': family_name
+                }
+            participacoes_por_player[user_id][tipo] = quantidade
+        
+        cursor.close()
+        conn.close()
+        
+        return {
+            'eventos_por_tipo': eventos_por_tipo,
+            'participacoes_por_player': participacoes_por_player,
+            'total_eventos': total_eventos,
+            'mes': mes_referencia
+        }
+    
+    def limpar_eventos_mes_anterior(self):
+        """Limpa eventos de meses anteriores ao atual (chamado no dia 1)"""
+        conn = self.get_connection()
+        cursor = conn.cursor()
+        
+        from datetime import datetime
+        mes_atual = datetime.now().strftime("%Y-%m")
+        
+        try:
+            # Deletar participações de eventos antigos
+            cursor.execute('''
+                DELETE FROM participacoes 
+                WHERE evento_id IN (
+                    SELECT id FROM eventos WHERE mes_referencia < %s
+                )
+            ''', (mes_atual,))
+            
+            # Deletar eventos antigos
+            cursor.execute('''
+                DELETE FROM eventos WHERE mes_referencia < %s
+            ''', (mes_atual,))
+            
+            deleted = cursor.rowcount
+            conn.commit()
+            cursor.close()
+            conn.close()
+            return deleted
+        except Exception as e:
+            conn.rollback()
+            cursor.close()
+            conn.close()
+            raise e
 

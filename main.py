@@ -6,7 +6,7 @@ import io
 import logging
 from datetime import datetime
 from pytz import timezone
-from config import DISCORD_TOKEN, BDO_CLASSES, DATABASE_NAME, DATABASE_URL, ALLOWED_DM_ROLES, NOTIFICATION_CHANNEL_ID, GUILD_MEMBER_ROLE_ID, DM_REPORT_CHANNEL_ID, LIST_CHANNEL_ID, MOVE_LOG_CHANNEL_ID, REGISTERED_ROLE_ID, UNREGISTERED_ROLE_ID, GS_UPDATE_REMINDER_DAYS, GS_REMINDER_CHECK_HOUR
+from config import DISCORD_TOKEN, BDO_CLASSES, DATABASE_NAME, DATABASE_URL, ALLOWED_DM_ROLES, NOTIFICATION_CHANNEL_ID, GUILD_MEMBER_ROLE_ID, DM_REPORT_CHANNEL_ID, LIST_CHANNEL_ID, MOVE_LOG_CHANNEL_ID, REGISTERED_ROLE_ID, UNREGISTERED_ROLE_ID, GS_UPDATE_REMINDER_DAYS, GS_REMINDER_CHECK_HOUR, ADMIN_USER_IDS
 from datetime import timedelta
 # Importar o banco de dados apropriado
 if DATABASE_URL:
@@ -20,6 +20,27 @@ intents.message_content = True
 intents.members = True  # Necessário para ver membros e cargos
 intents.presences = True  # Necessário para ver status online/offline
 bot = commands.Bot(command_prefix='!', intents=intents)
+
+
+# Função helper para verificar se usuário tem permissão de admin
+def is_admin_user(user: discord.Member) -> bool:
+    """
+    Verifica se o usuário pode usar comandos de admin.
+    Retorna True se:
+    - O usuário é administrador do servidor OU
+    - O ID do usuário está na lista ADMIN_USER_IDS
+    """
+    # Verificar se é administrador do servidor
+    if user.guild_permissions.administrator:
+        return True
+    
+    # Verificar se está na lista de usuários admin
+    user_id_str = str(user.id)
+    if ADMIN_USER_IDS and user_id_str in ADMIN_USER_IDS:
+        logger.info(f"[ADMIN] Usuário {user.display_name} (ID: {user_id_str}) autorizado via ADMIN_USER_IDS")
+        return True
+    
+    return False
 
 # Função helper para verificar se usuário tem permissão para usar comandos de DM em massa
 def has_dm_permission(member: discord.Member) -> bool:
@@ -50,6 +71,100 @@ def calculate_gs(ap, aap, dp):
     """Calcula o Gearscore: maior entre AP ou AAP + DP"""
     return max(ap, aap) + dp
 
+# Função helper para calcular posição no ranking (otimizada)
+async def get_player_ranking_position(guild: discord.Guild, user_id: str, current_gs: int):
+    """
+    Calcula a posição do player no ranking de GS da guilda.
+    Retorna: (posicao, total_players, players_acima, players_abaixo, percentil)
+    """
+    try:
+        # Buscar apenas membros que têm o cargo da guilda
+        valid_user_ids = await get_guild_member_ids(guild)
+        logger.debug(f"get_player_ranking_position: valid_user_ids count = {len(valid_user_ids)}")
+        
+        if not valid_user_ids:
+            logger.debug("get_player_ranking_position: Nenhum membro válido encontrado")
+            return None
+        
+        # Se o user_id não está na lista de válidos, não tem ranking
+        # Garantir que user_id é string para comparação
+        user_id_str = str(user_id)
+        if user_id_str not in valid_user_ids:
+            logger.debug(f"get_player_ranking_position: user_id {user_id_str} não está na lista de válidos (total: {len(valid_user_ids)})")
+            return None
+        
+        # Buscar todos os gearscores (já filtrados por valid_user_ids)
+        all_gearscores = db.get_all_gearscores(valid_user_ids=valid_user_ids)
+        logger.debug(f"get_player_ranking_position: all_gearscores count = {len(all_gearscores) if all_gearscores else 0}")
+        
+        if not all_gearscores:
+            logger.debug("get_player_ranking_position: Nenhum gearscore encontrado")
+            return None
+        
+        # Processar e calcular GS de cada player (otimizado - sem verificar cargo novamente)
+        players_gs = []
+        for record in all_gearscores:
+            # Extrair dados do registro
+            if isinstance(record, dict):
+                record_user_id = record.get('user_id', '')
+                ap = record.get('ap', 0)
+                aap = record.get('aap', 0)
+                dp = record.get('dp', 0)
+            else:
+                record_user_id = record[1] if len(record) > 1 else ''
+                ap = record[5] if len(record) > 5 else 0
+                aap = record[6] if len(record) > 6 else 0
+                dp = record[7] if len(record) > 7 else 0
+            
+            # Não precisa verificar cargo novamente - já foi filtrado por valid_user_ids
+            # Apenas garantir que o user_id está no set válido (comparar como strings)
+            if str(record_user_id) not in valid_user_ids:
+                continue
+            
+            gs = max(ap, aap) + dp
+            players_gs.append({
+                'user_id': record_user_id,
+                'gs': gs
+            })
+        
+        if not players_gs:
+            return None
+        
+        # Ordenar por GS (maior para menor)
+        players_gs.sort(key=lambda x: x['gs'], reverse=True)
+        
+        # Encontrar posição do player atual
+        posicao = None
+        for idx, player in enumerate(players_gs, 1):
+            # Comparar como strings para garantir compatibilidade
+            if str(player['user_id']) == user_id_str:
+                posicao = idx
+                break
+        
+        if posicao is None:
+            logger.debug(f"get_player_ranking_position: Posição não encontrada para user_id {user_id}")
+            return None
+        
+        total_players = len(players_gs)
+        players_acima = posicao - 1
+        players_abaixo = total_players - posicao
+        
+        # Calcular percentil (0-100, onde 100 é o melhor)
+        percentil = int(round((total_players - posicao + 1) / total_players * 100))
+        
+        result = {
+            'posicao': posicao,
+            'total_players': total_players,
+            'players_acima': players_acima,
+            'players_abaixo': players_abaixo,
+            'percentil': percentil
+        }
+        logger.debug(f"get_player_ranking_position: Resultado = {result}")
+        return result
+    except Exception as e:
+        logger.error(f"Erro ao calcular ranking: {e}", exc_info=True)
+        return None
+
 # Função helper para verificar se um membro tem o cargo da guilda
 def has_guild_role(member: discord.Member) -> bool:
     """Verifica se o membro tem o cargo que indica participação na guilda"""
@@ -73,6 +188,38 @@ async def get_guild_member_ids(guild: discord.Guild) -> set:
             member_ids.add(str(member.id))
     
     return member_ids
+
+# Função helper para atualizar o nickname do membro para o nome de família
+async def update_member_nickname(member: discord.Member, family_name: str) -> tuple:
+    """
+    Atualiza o nickname do membro para o nome de família.
+    Retorna: (sucesso: bool, mensagem: str)
+    """
+    if not member or not member.guild:
+        return False, "Membro não encontrado"
+    
+    # Não pode alterar nickname do dono do servidor
+    if member.id == member.guild.owner_id:
+        return False, "Não é possível alterar o nickname do dono do servidor"
+    
+    # Verificar se o bot tem permissão
+    bot_member = member.guild.me
+    if not bot_member.guild_permissions.manage_nicknames:
+        return False, "Bot sem permissão para gerenciar nicknames"
+    
+    # Verificar hierarquia de cargos
+    if member.top_role >= bot_member.top_role:
+        return False, "Membro tem cargo igual ou superior ao bot"
+    
+    try:
+        # Limitar nickname a 32 caracteres (limite do Discord)
+        nickname = family_name[:32] if len(family_name) > 32 else family_name
+        await member.edit(nick=nickname, reason="Atualização automática para nome de família")
+        return True, f"Nickname atualizado para '{nickname}'"
+    except discord.Forbidden:
+        return False, "Sem permissão para alterar nickname deste membro"
+    except discord.HTTPException as e:
+        return False, f"Erro ao alterar nickname: {str(e)}"
 
 # Função helper para gerenciar cargos de registro
 async def update_registration_roles(member: discord.Member, has_registration: bool):
@@ -289,6 +436,27 @@ async def before_gs_reminder():
     
     await discord.utils.sleep_until(target_time)
 
+# Task para limpar eventos do mês anterior (roda no dia 1 de cada mês)
+@tasks.loop(hours=24)
+async def eventos_reset_task():
+    """Task que limpa eventos do mês anterior no dia 1 de cada mês"""
+    now = datetime.now()
+    
+    # Só executa no dia 1
+    if now.day == 1:
+        logger.info("Dia 1 do mês - Iniciando reset de eventos do mês anterior...")
+        try:
+            deleted = db.limpar_eventos_mes_anterior()
+            logger.info(f"Reset de eventos concluído: {deleted} eventos removidos")
+        except Exception as e:
+            logger.error(f"Erro ao fazer reset de eventos: {e}")
+
+@eventos_reset_task.before_loop
+async def before_eventos_reset():
+    """Aguarda o bot estar pronto antes de iniciar a task"""
+    await bot.wait_until_ready()
+    logger.info("Task de reset mensal de eventos iniciada")
+
 # Função helper para enviar notificação ao canal
 async def send_notification_to_channel(bot, interaction, action_type, nome_familia, classe_pvp, ap, aap, dp, linkgear):
     """Envia notificação de registro/atualização para o canal especificado"""
@@ -423,6 +591,11 @@ async def on_ready():
     if not gs_reminder_task.is_running():
         gs_reminder_task.start()
         logger.info(f'Task de lembrete de GS iniciada (verificação a cada {GS_UPDATE_REMINDER_DAYS} dias)')
+    
+    # Iniciar task de reset mensal de eventos
+    if not eventos_reset_task.is_running():
+        eventos_reset_task.start()
+        logger.info('Task de reset mensal de eventos iniciada (executa no dia 1 de cada mês)')
 
 @bot.event
 async def on_member_update(before: discord.Member, after: discord.Member):
@@ -546,7 +719,28 @@ async def registro(
     linkgear: str
 ):
     # Deferir resposta IMEDIATAMENTE para evitar timeout
-    await interaction.response.defer(ephemeral=True)
+    try:
+        await interaction.response.defer(ephemeral=True)
+    except discord.errors.NotFound:
+        # Interação já expirou, tentar enviar mensagem direta
+        try:
+            await interaction.followup.send(
+                "⏱️ A interação expirou. Por favor, tente novamente.",
+                ephemeral=True
+            )
+        except:
+            pass
+        return
+    except Exception as e:
+        logger.error(f"Erro ao defer interação: {e}")
+        try:
+            await interaction.followup.send(
+                "❌ Erro ao processar comando. Por favor, tente novamente.",
+                ephemeral=True
+            )
+        except:
+            pass
+        return
     
     try:
         # Validar valores numéricos
@@ -622,8 +816,26 @@ async def registro(
         if member:
             await update_registration_roles(member, has_registration=True)
         
+        # Atualizar nickname para o nome de família
+        nickname_updated = False
+        nickname_error = None
+        if member:
+            logger.info(f"[/registro] Tentando atualizar nickname de {member.display_name} (ID: {member.id}) para '{nome_familia}'")
+            nick_success, nick_msg = await update_member_nickname(member, nome_familia)
+            if nick_success:
+                nickname_updated = True
+                logger.info(f"[/registro] Nickname atualizado com sucesso para {member.display_name}")
+            else:
+                nickname_error = nick_msg
+                logger.warning(f"[/registro] Falha ao atualizar nickname de {member.display_name}: {nick_msg}")
+        else:
+            logger.warning(f"[/registro] Member não encontrado para atualizar nickname")
+        
         # Calcular GS total (MAX(AP, AAP) + DP)
         gs_total = calculate_gs(ap, aap, dp)
+        
+        # Buscar posição no ranking
+        ranking_info = await get_player_ranking_position(interaction.guild, user_id, gs_total)
         
         embed = discord.Embed(
             title="✅ Gearscore Registrado!",
@@ -637,12 +849,30 @@ async def registro(
         embed.add_field(name="🔥 AAP", value=f"{aap}", inline=True)
         embed.add_field(name="🛡️ DP", value=f"{dp}", inline=True)
         embed.add_field(name="📊 GS Total", value=f"**{gs_total}** (MAX({ap}, {aap}) + {dp})", inline=False)
+        
+        # Adicionar informação de ranking (gamificação)
+        if ranking_info:
+            posicao = ranking_info['posicao']
+            
+            # Mensagem simplificada
+            if posicao <= 3:
+                ranking_value = f"🎉 **Parabéns! Você está no top 3 pessoas mais fortes da aliança!** 🏆"
+            else:
+                ranking_value = f"🎉 **Parabéns! Você está em {posicao}º lugar na aliança!**"
+            
+            embed.add_field(name="🏆 Seu Ranking", value=ranking_value, inline=False)
+        
         embed.add_field(name="🔗 Link Gear", value=linkgear, inline=False)
         
         if role_added:
             embed.add_field(name="🎖️ Cargo", value="Cargo da guilda atribuído com sucesso!", inline=False)
         elif role_error:
             embed.add_field(name="⚠️ Aviso", value=f"Não foi possível adicionar o cargo: {role_error}", inline=False)
+        
+        if nickname_updated:
+            embed.add_field(name="✏️ Nickname", value=f"Seu apelido foi atualizado para **{nome_familia}**", inline=False)
+        elif nickname_error:
+            embed.add_field(name="⚠️ Nickname", value=f"Não foi possível atualizar o apelido: {nickname_error}", inline=False)
         
         embed.set_footer(text=f"Registrado por {interaction.user.display_name}")
         
@@ -685,7 +915,7 @@ async def registro_manual(
     linkgear: str
 ):
     """Registra gearscore manualmente para outro membro (apenas administradores)"""
-    if not interaction.user.guild_permissions.administrator:
+    if not is_admin_user(interaction.user):
         await interaction.response.send_message(
             "❌ Apenas administradores podem usar este comando!",
             ephemeral=True
@@ -769,6 +999,16 @@ async def registro_manual(
         if member:
             await update_registration_roles(member, has_registration=True)
         
+        # Atualizar nickname para o nome de família
+        nickname_updated = False
+        nickname_error = None
+        if member:
+            nick_success, nick_msg = await update_member_nickname(member, nome_familia)
+            if nick_success:
+                nickname_updated = True
+            else:
+                nickname_error = nick_msg
+        
         # Calcular GS total (MAX(AP, AAP) + DP)
         gs_total = calculate_gs(ap, aap, dp)
         
@@ -791,6 +1031,11 @@ async def registro_manual(
             embed.add_field(name="🎖️ Cargo", value="Cargo da guilda atribuído com sucesso!", inline=False)
         elif role_error:
             embed.add_field(name="⚠️ Aviso", value=f"Não foi possível adicionar o cargo: {role_error}", inline=False)
+        
+        if nickname_updated:
+            embed.add_field(name="✏️ Nickname", value=f"Apelido atualizado para **{nome_familia}**", inline=False)
+        elif nickname_error:
+            embed.add_field(name="⚠️ Nickname", value=f"Não foi possível atualizar o apelido: {nickname_error}", inline=False)
         
         embed.set_footer(text=f"Registrado manualmente por {interaction.user.display_name}")
         
@@ -893,7 +1138,19 @@ async def atualizar(
     classe_pvp: str = None
 ):
     # Deferir resposta IMEDIATAMENTE para evitar timeout
-    await interaction.response.defer(ephemeral=True)
+    deferred = False
+    try:
+        if not interaction.response.is_done():
+            await interaction.response.defer(ephemeral=True)
+            deferred = True
+    except discord.errors.NotFound:
+        # Interação já expirou, mas vamos tentar continuar
+        logger.warning("Interação expirada ao tentar defer no /atualizar, mas continuando...")
+        deferred = False
+    except Exception as e:
+        logger.error(f"Erro ao defer interação no /atualizar: {e}")
+        # Tentar continuar mesmo se o defer falhar
+        deferred = False
     
     try:
         # Validar valores numéricos
@@ -977,7 +1234,22 @@ async def atualizar(
         if nome_personagem is None:
             nome_personagem = current_character_name
         
-        # Atualizar gearscore
+        # Buscar GS anterior antes de atualizar (apenas para mostrar diferença)
+        old_gs_data = db.get_gearscore(user_id)
+        old_gs = None
+        if old_gs_data:
+            result = old_gs_data[0]
+            if isinstance(result, dict):
+                old_ap = result.get('ap', 0)
+                old_aap = result.get('aap', 0)
+                old_dp = result.get('dp', 0)
+            else:
+                old_ap = result[5] if len(result) > 5 else 0
+                old_aap = result[6] if len(result) > 6 else 0
+                old_dp = result[7] if len(result) > 7 else 0
+            old_gs = calculate_gs(old_ap, old_aap, old_dp)
+        
+        # Atualizar gearscore PRIMEIRO (mais rápido)
         logger.info(f"Comando /atualizar executado por {interaction.user.display_name} (ID: {user_id}) - {nome_familia} ({classe_pvp}) - GS: {calculate_gs(ap, aap, dp)}")
         db.update_gearscore(
             user_id=user_id,
@@ -991,8 +1263,40 @@ async def atualizar(
         )
         logger.info(f"Gearscore atualizado com sucesso para {interaction.user.display_name} (ID: {user_id})")
         
+        # Atualizar nickname se o nome de família mudou
+        nickname_updated = False
+        nickname_error = None
+        member = interaction.guild.get_member(interaction.user.id)
+        if member and nome_familia != current_family_name:
+            nick_success, nick_msg = await update_member_nickname(member, nome_familia)
+            if nick_success:
+                nickname_updated = True
+            else:
+                nickname_error = nick_msg
+        
         # Calcular GS total
         gs_total = calculate_gs(ap, aap, dp)
+        
+        # Buscar ranking atual (após atualização) e antigo (se necessário para comparação)
+        new_ranking = None
+        old_ranking = None
+        try:
+            logger.info(f"Buscando ranking para user_id={user_id}, gs_total={gs_total}")
+            new_ranking = await get_player_ranking_position(interaction.guild, user_id, gs_total)
+            logger.info(f"Ranking encontrado: {new_ranking}")
+            
+            # Buscar ranking antigo apenas se o GS mudou e queremos mostrar a diferença
+            if old_gs is not None and old_gs != gs_total:
+                try:
+                    old_ranking = await get_player_ranking_position(interaction.guild, user_id, old_gs)
+                    logger.info(f"Ranking antigo encontrado: {old_ranking}")
+                except Exception as e:
+                    logger.warning(f"Erro ao buscar ranking antigo: {e}")
+                    old_ranking = None
+        except Exception as e:
+            logger.error(f"Erro ao buscar ranking: {e}", exc_info=True)
+            new_ranking = None
+            old_ranking = None
         
         embed = discord.Embed(
             title="✅ Gearscore Atualizado!",
@@ -1007,6 +1311,45 @@ async def atualizar(
         embed.add_field(name="🔥 AAP", value=f"{aap}", inline=True)
         embed.add_field(name="🛡️ DP", value=f"{dp}", inline=True)
         embed.add_field(name="📊 GS Total", value=f"**{gs_total}** (MAX({ap}, {aap}) + {dp})", inline=False)
+        
+        # Mostrar mudança de GS se houver
+        if old_gs is not None and old_gs != gs_total:
+            gs_diff = gs_total - old_gs
+            if gs_diff > 0:
+                gs_change = f"📈 **+{gs_diff} GS** (era {old_gs})"
+            else:
+                gs_change = f"📉 **{gs_diff} GS** (era {old_gs})"
+            embed.add_field(name="🔄 Mudança de GS", value=gs_change, inline=False)
+        
+        # Adicionar informação de ranking (gamificação)
+        if new_ranking:
+            posicao = new_ranking['posicao']
+            
+            # Mensagem simplificada
+            if posicao <= 3:
+                ranking_value = f"🎉 **Parabéns! Você está no top 3 pessoas mais fortes da aliança!** 🏆"
+            else:
+                ranking_value = f"🎉 **Parabéns! Você está em {posicao}º lugar na aliança!**"
+            
+            # Mostrar mudança de posição se subiu
+            if old_ranking and old_ranking['posicao'] != posicao:
+                pos_diff = old_ranking['posicao'] - posicao
+                if pos_diff > 0:
+                    ranking_value += f"\n\n🎯 **Subiu {pos_diff} posição(ões)!** ⬆️"
+            
+            embed.add_field(name="🏆 Seu Ranking", value=ranking_value, inline=False)
+        else:
+            # Se o ranking não estiver disponível, adicionar mensagem informativa
+            logger.warning(f"Ranking não disponível para user_id={user_id}")
+            # Verificar se o usuário tem o cargo da guilda
+            member_check = interaction.guild.get_member(interaction.user.id)
+            if member_check and has_guild_role(member_check):
+                embed.add_field(
+                    name="🏆 Seu Ranking", 
+                    value="⚠️ Ranking temporariamente indisponível. Tente novamente em alguns instantes.",
+                    inline=False
+                )
+        
         embed.add_field(name="🔗 Link Gear", value=linkgear, inline=False)
         
         if current_class_pvp != classe_pvp:
@@ -1015,6 +1358,11 @@ async def atualizar(
                 value=f"Classe alterada de **{current_class_pvp}** para **{classe_pvp}**",
                 inline=False
             )
+        
+        if nickname_updated:
+            embed.add_field(name="✏️ Nickname", value=f"Seu apelido foi atualizado para **{nome_familia}**", inline=False)
+        elif nickname_error:
+            embed.add_field(name="⚠️ Nickname", value=f"Não foi possível atualizar o apelido: {nickname_error}", inline=False)
         
         embed.set_footer(text=f"Atualizado por {interaction.user.display_name}")
         
@@ -1309,7 +1657,7 @@ async def perfil(interaction: discord.Interaction):
 @app_commands.default_permissions(administrator=True)
 async def pre(interaction: discord.Interaction, usuario: discord.Member):
     """Visualiza o perfil de outro membro (apenas administradores)"""
-    if not interaction.user.guild_permissions.administrator:
+    if not is_admin_user(interaction.user):
         await interaction.response.send_message(
             "❌ Apenas administradores podem usar este comando!",
             ephemeral=True
@@ -1956,7 +2304,7 @@ class ClassStatsView(discord.ui.View):
 @app_commands.default_permissions(administrator=True)
 async def estatisticas_classes(interaction: discord.Interaction):
     """Mostra estatísticas das classes na guilda (apenas administradores)"""
-    if not interaction.user.guild_permissions.administrator:
+    if not is_admin_user(interaction.user):
         await interaction.response.send_message(
             "❌ Apenas administradores podem usar este comando!",
             ephemeral=True
@@ -2046,7 +2394,11 @@ async def estatisticas_classes(interaction: discord.Interaction):
         embed.add_field(name="\u200b", value="\u200b", inline=True)  # Espaçador
         
         # Criar lista formatada das classes (ordenada por quantidade)
-        class_ranking = ""
+        # Dividir em múltiplos campos se necessário (limite de 1024 caracteres por field)
+        class_ranking_parts = []
+        current_part = ""
+        field_count = 0
+        
         for i, (class_name, total, avg_gs) in enumerate(stats_list, 1):
             avg_gs_int = int(round(avg_gs)) if avg_gs else 0
             # Emoji baseado na posição
@@ -2059,13 +2411,43 @@ async def estatisticas_classes(interaction: discord.Interaction):
             else:
                 medal = f"`{i:2d}`"
             
-            class_ranking += f"{medal} **{class_name}** — {total} membro(s) • GS: {avg_gs_int}\n"
+            line = f"{medal} **{class_name}** — {total} membro(s) • GS: {avg_gs_int}\n"
+            
+            # Truncar linha se for muito grande (não deve acontecer, mas por segurança)
+            if len(line) > 1024:
+                line = line[:1020] + "...\n"
+            
+            # Verificar se adicionar esta linha excederia o limite
+            if len(current_part) + len(line) > 1024:
+                # Se exceder, salvar o campo atual e começar um novo
+                if current_part:
+                    class_ranking_parts.append(current_part)
+                current_part = line  # Começar novo campo com a linha atual
+            else:
+                current_part += line
         
-        embed.add_field(
-            name="🏆 Ranking de Classes (por quantidade)",
-            value=class_ranking if class_ranking else "Nenhuma classe encontrada",
-            inline=False
-        )
+        # Adicionar o último campo se houver conteúdo
+        if current_part:
+            class_ranking_parts.append(current_part)
+        
+        # Adicionar os campos ao embed
+        if class_ranking_parts:
+            for idx, part in enumerate(class_ranking_parts):
+                field_count += 1
+                field_name = "🏆 Ranking de Classes (por quantidade)" if field_count == 1 else f"🏆 Ranking (cont. {field_count})"
+                # Garantir que não exceda 1024 (por segurança)
+                value = part[:1024] if len(part) > 1024 else part
+                embed.add_field(
+                    name=field_name,
+                    value=value,
+                    inline=False
+                )
+        elif not stats_list:
+            embed.add_field(
+                name="🏆 Ranking de Classes",
+                value="Nenhuma classe encontrada",
+                inline=False
+            )
         
         embed.set_footer(text=f"Total de {total_chars} personagens cadastrados • Selecione uma classe abaixo")
         
@@ -2091,7 +2473,7 @@ async def estatisticas_classes(interaction: discord.Interaction):
 @app_commands.default_permissions(administrator=True)
 async def stats(interaction: discord.Interaction):
     """Mostra lista completa de todos os membros com gearscore (apenas administradores)"""
-    if not interaction.user.guild_permissions.administrator:
+    if not is_admin_user(interaction.user):
         await interaction.response.send_message(
             "❌ Apenas administradores podem usar este comando!",
             ephemeral=True
@@ -2338,7 +2720,7 @@ async def stats(interaction: discord.Interaction):
 @app_commands.default_permissions(administrator=True)
 async def ranking_gearscore(interaction: discord.Interaction):
     """Mostra o ranking de gearscore (apenas administradores)"""
-    if not interaction.user.guild_permissions.administrator:
+    if not is_admin_user(interaction.user):
         await interaction.response.send_message(
             "❌ Apenas administradores podem usar este comando!",
             ephemeral=True
@@ -2435,7 +2817,7 @@ async def ranking_gearscore(interaction: discord.Interaction):
 @app_commands.default_permissions(administrator=True)
 async def membros_classe(interaction: discord.Interaction, classe: str):
     """Visualiza todos os membros registrados de uma classe com todas as informações (apenas administradores)"""
-    if not interaction.user.guild_permissions.administrator:
+    if not is_admin_user(interaction.user):
         await interaction.response.send_message(
             "❌ Apenas administradores podem usar este comando!",
             ephemeral=True
@@ -2709,13 +3091,20 @@ async def voice_channel_autocomplete(
         for channel in filtered
     ]
 
-@bot.tree.command(name="lista", description="Cria uma lista dos membros em um canal de voz")
+# Tipos de eventos disponíveis
+TIPOS_EVENTO = ["GvG", "Treino"]
+
+@bot.tree.command(name="lista", description="Cria uma lista dos membros em um canal de voz e registra participação")
 @app_commands.describe(
     sala="Canal de voz para listar os membros (digite para buscar)",
-    nome_lista="Nome da lista"
+    nome_lista="Nome da lista/evento",
+    tipo="Tipo do evento (GvG, Treino, etc) - opcional para registrar participação"
 )
 @app_commands.autocomplete(sala=voice_channel_autocomplete)
-async def lista(interaction: discord.Interaction, sala: str, nome_lista: str):
+@app_commands.choices(tipo=[
+    app_commands.Choice(name=t, value=t) for t in TIPOS_EVENTO
+])
+async def lista(interaction: discord.Interaction, sala: str, nome_lista: str, tipo: str = None):
     """Cria uma lista dos membros conectados em um canal de voz e envia para o canal de listas"""
     try:
         if not interaction.guild:
@@ -2737,14 +3126,24 @@ async def lista(interaction: discord.Interaction, sala: str, nome_lista: str):
             return
         
         # Buscar membros conectados no canal de voz
-        members_in_voice = [
+        all_members_in_voice = [
             member for member in voice_channel.members
             if not member.bot  # Excluir bots
         ]
         
+        # Filtrar apenas membros com cargo da guilda
+        members_in_voice = [
+            member for member in all_members_in_voice
+            if has_guild_role(member)
+        ]
+        
+        # Contar membros removidos (sem cargo da guilda)
+        members_removed = len(all_members_in_voice) - len(members_in_voice)
+        
         if not members_in_voice:
             await interaction.followup.send(
-                f"❌ Nenhum membro encontrado no canal de voz **{voice_channel.name}**!",
+                f"❌ Nenhum membro com cargo da guilda encontrado no canal de voz **{voice_channel.name}**!\n"
+                f"ℹ️ {members_removed} membro(s) sem cargo da guilda foram ignorados.",
                 ephemeral=True
             )
             return
@@ -2761,11 +3160,59 @@ async def lista(interaction: discord.Interaction, sala: str, nome_lista: str):
             )
             return
         
+        # Registrar participação se tipo foi informado
+        evento_registrado = False
+        if tipo:
+            try:
+                # Preparar lista de participantes
+                participantes = []
+                for member in members_in_voice:
+                    # Buscar family_name do registro
+                    user_data = db.get_user_current_data(str(member.id))
+                    family_name = user_data[0] if user_data else None
+                    
+                    participantes.append({
+                        'user_id': str(member.id),
+                        'family_name': family_name,
+                        'display_name': member.display_name
+                    })
+                
+                # Registrar evento
+                evento_id, qtd = db.registrar_evento(
+                    tipo=tipo,
+                    nome=nome_lista,
+                    canal_voz=voice_channel.name,
+                    criado_por=str(interaction.user.id),
+                    criado_por_nome=interaction.user.display_name,
+                    participantes=participantes
+                )
+                evento_registrado = True
+                logger.info(f"Evento '{nome_lista}' ({tipo}) registrado com {qtd} participantes por {interaction.user.display_name}")
+            except Exception as e:
+                logger.error(f"Erro ao registrar evento: {e}")
+        
+        # Definir cor baseada no tipo
+        cores_tipo = {
+            "GvG": discord.Color.red(),
+            "Treino": discord.Color.green(),
+            "Node War": discord.Color.orange(),
+            "Siege": discord.Color.purple(),
+            "Boss": discord.Color.gold(),
+            "Grind": discord.Color.teal(),
+            "Outro": discord.Color.blue()
+        }
+        cor = cores_tipo.get(tipo, discord.Color.blue()) if tipo else discord.Color.blue()
+        
         # Criar embed com a lista
+        titulo = f"📋 {nome_lista}"
+        if tipo:
+            emojis_tipo = {"GvG": "⚔️", "Treino": "🏋️", "Node War": "🏰", "Siege": "🛡️", "Boss": "👹", "Grind": "💰", "Outro": "📌"}
+            titulo = f"{emojis_tipo.get(tipo, '📋')} {nome_lista} ({tipo})"
+        
         embed = discord.Embed(
-            title=f"📋 {nome_lista}",
+            title=titulo,
             description=f"Lista de membros do canal de voz: **{voice_channel.mention}**",
-            color=discord.Color.blue(),
+            color=cor,
             timestamp=discord.utils.utcnow()
         )
         
@@ -2781,6 +3228,13 @@ async def lista(interaction: discord.Interaction, sala: str, nome_lista: str):
             value=f"**{len(members_in_voice)}** membro(s)",
             inline=True
         )
+        
+        if tipo:
+            embed.add_field(
+                name="📊 Tipo",
+                value=f"**{tipo}**",
+                inline=True
+            )
         
         # Formatar data e horário (fuso horário de Brasília)
         brasilia_tz = timezone('America/Sao_Paulo')
@@ -2830,15 +3284,23 @@ async def lista(interaction: discord.Interaction, sala: str, nome_lista: str):
                 inline=False
             )
         
-        embed.set_footer(text=f"Lista criada por {interaction.user.display_name}")
+        footer_text = f"Lista criada por {interaction.user.display_name}"
+        if evento_registrado:
+            footer_text += " | ✅ Participação registrada"
+        if members_removed > 0:
+            footer_text += f" | ⚠️ {members_removed} membro(s) sem cargo removido(s)"
+        embed.set_footer(text=footer_text)
         
         # Enviar para o canal de listas
         await list_channel.send(embed=embed)
         
-        await interaction.followup.send(
-            f"✅ Lista **{nome_lista}** criada com sucesso e enviada para o canal de listas!",
-            ephemeral=True
-        )
+        msg_sucesso = f"✅ Lista **{nome_lista}** criada com sucesso e enviada para o canal de listas!"
+        if evento_registrado:
+            msg_sucesso += f"\n📊 **{len(members_in_voice)}** participações registradas para o tipo **{tipo}**"
+        if members_removed > 0:
+            msg_sucesso += f"\n⚠️ **{members_removed}** membro(s) sem cargo da guilda foram automaticamente removidos da lista"
+        
+        await interaction.followup.send(msg_sucesso, ephemeral=True)
         
     except ValueError:
         await interaction.followup.send(
@@ -2861,6 +3323,145 @@ async def lista(interaction: discord.Interaction, sala: str, nome_lista: str):
                 ephemeral=True
             )
 
+@bot.tree.command(name="relatorio_lista", description="[ADMIN] Mostra relatório de participação em eventos do mês")
+@app_commands.default_permissions(administrator=True)
+async def relatorio_lista(interaction: discord.Interaction):
+    """Mostra relatório de participação em eventos (GvG, Treino, etc) do mês atual"""
+    if not is_admin_user(interaction.user):
+        await interaction.response.send_message(
+            "❌ Apenas administradores podem usar este comando!",
+            ephemeral=True
+        )
+        return
+    
+    try:
+        await interaction.response.defer(ephemeral=True)
+        
+        # Buscar relatório do mês atual
+        relatorio = db.get_relatorio_participacoes()
+        
+        if relatorio['total_eventos'] == 0:
+            await interaction.followup.send(
+                "📊 **Relatório de Participação**\n\n"
+                "❌ Nenhum evento registrado neste mês ainda.\n\n"
+                "💡 Use `/lista` com o parâmetro `tipo` para registrar participações.",
+                ephemeral=True
+            )
+            return
+        
+        # Formatar mês de referência
+        from datetime import datetime
+        mes_ref = relatorio['mes']
+        ano, mes = mes_ref.split('-')
+        meses_nome = {
+            '01': 'Janeiro', '02': 'Fevereiro', '03': 'Março', '04': 'Abril',
+            '05': 'Maio', '06': 'Junho', '07': 'Julho', '08': 'Agosto',
+            '09': 'Setembro', '10': 'Outubro', '11': 'Novembro', '12': 'Dezembro'
+        }
+        mes_nome = f"{meses_nome.get(mes, mes)}/{ano}"
+        
+        # Criar embed principal
+        embed = discord.Embed(
+            title=f"📊 Relatório de Participação - {mes_nome}",
+            description="Resumo de eventos e participações do mês",
+            color=discord.Color.gold(),
+            timestamp=discord.utils.utcnow()
+        )
+        
+        # Resumo de eventos
+        eventos_texto = ""
+        emojis_tipo = {"GvG": "⚔️", "Treino": "🏋️", "Node War": "🏰", "Siege": "🛡️", "Boss": "👹", "Grind": "💰", "Outro": "📌"}
+        for tipo, qtd in relatorio['eventos_por_tipo'].items():
+            emoji = emojis_tipo.get(tipo, "📌")
+            eventos_texto += f"{emoji} **{tipo}:** {qtd} evento(s)\n"
+        
+        embed.add_field(
+            name=f"📅 Total de Eventos: {relatorio['total_eventos']}",
+            value=eventos_texto if eventos_texto else "Nenhum evento",
+            inline=False
+        )
+        
+        # Calcular participação total por player (apenas os que ainda têm cargo da guilda)
+        players_participacao = []
+        players_removidos_count = 0
+        
+        for user_id, dados in relatorio['participacoes_por_player'].items():
+            # Verificar se o membro ainda tem o cargo da guilda
+            try:
+                member = interaction.guild.get_member(int(user_id))
+                if not member or not has_guild_role(member):
+                    # Player não tem mais o cargo, não incluir no relatório
+                    players_removidos_count += 1
+                    continue
+            except (ValueError, AttributeError):
+                # Se não conseguir verificar (membro saiu do servidor, etc), não incluir
+                players_removidos_count += 1
+                continue
+            
+            total = sum(v for k, v in dados.items() if k not in ['display_name', 'family_name'])
+            players_participacao.append({
+                'user_id': user_id,
+                'display_name': dados.get('display_name', user_id),
+                'family_name': dados.get('family_name'),
+                'total': total,
+                'detalhes': dados
+            })
+        
+        # Ordenar por total de participações
+        players_participacao.sort(key=lambda x: x['total'], reverse=True)
+        
+        # Top 20 participantes
+        top_players_texto = ""
+        for i, player in enumerate(players_participacao[:20], 1):
+            nome = player['family_name'] or player['display_name']
+            
+            # Montar detalhes por tipo
+            detalhes = []
+            for tipo in TIPOS_EVENTO:
+                if tipo in player['detalhes']:
+                    detalhes.append(f"{tipo}: {player['detalhes'][tipo]}")
+            
+            detalhes_str = " | ".join(detalhes) if detalhes else ""
+            top_players_texto += f"**{i}.** {nome} - **{player['total']}** ({detalhes_str})\n"
+        
+        if top_players_texto:
+            # Dividir se muito grande
+            if len(top_players_texto) > 1024:
+                partes = [top_players_texto[i:i+1020] for i in range(0, len(top_players_texto), 1020)]
+                for idx, parte in enumerate(partes[:2]):
+                    nome_campo = "🏆 Top Participantes" if idx == 0 else "🏆 Top Participantes (cont.)"
+                    embed.add_field(name=nome_campo, value=parte, inline=False)
+            else:
+                embed.add_field(name="🏆 Top Participantes", value=top_players_texto, inline=False)
+        
+        # Estatísticas
+        if players_participacao:
+            media = sum(p['total'] for p in players_participacao) / len(players_participacao)
+            embed.add_field(
+                name="📈 Estatísticas",
+                value=f"👥 **Total de players:** {len(players_participacao)}\n"
+                      f"📊 **Média de participações:** {media:.1f}",
+                inline=False
+            )
+        
+        embed.set_footer(text=f"Relatório gerado por {interaction.user.display_name} | Reset no dia 1 de cada mês | Apenas membros com cargo da guilda")
+        
+        await interaction.followup.send(embed=embed, ephemeral=True)
+        
+    except Exception as e:
+        import traceback
+        logger.error(f"Erro ao gerar relatório: {traceback.format_exc()}")
+        if interaction.response.is_done():
+            await interaction.followup.send(
+                f"❌ Erro ao gerar relatório: {str(e)}",
+                ephemeral=True
+            )
+        else:
+            await interaction.response.send_message(
+                f"❌ Erro ao gerar relatório: {str(e)}",
+                ephemeral=True
+            )
+
 @bot.tree.command(name="mover_sala", description="[ADMIN] Move todos os membros de uma sala de voz para outra")
 @app_commands.describe(
     sala_origem="Canal de voz de origem (digite para buscar)",
@@ -2871,7 +3472,7 @@ async def lista(interaction: discord.Interaction, sala: str, nome_lista: str):
 @app_commands.default_permissions(administrator=True)
 async def mover_sala(interaction: discord.Interaction, sala_origem: str, sala_destino: str):
     """Move todos os membros de uma sala de voz para outra (apenas administradores)"""
-    if not interaction.user.guild_permissions.administrator:
+    if not is_admin_user(interaction.user):
         await interaction.response.send_message(
             "❌ Apenas administradores podem usar este comando!",
             ephemeral=True
@@ -3406,7 +4007,7 @@ async def dm_cargo(interaction: discord.Interaction, cargos: str, mensagem: str,
 @app_commands.default_permissions(administrator=True)
 async def admin_lista_classe(interaction: discord.Interaction, classe: str):
     """Lista todos os membros de uma classe específica (apenas administradores)"""
-    if not interaction.user.guild_permissions.administrator:
+    if not is_admin_user(interaction.user):
         await interaction.response.send_message(
             "❌ Apenas administradores podem usar este comando!",
             ephemeral=True
@@ -3488,7 +4089,7 @@ async def admin_lista_classe(interaction: discord.Interaction, classe: str):
 @app_commands.default_permissions(administrator=True)
 async def admin_progresso_player(interaction: discord.Interaction, usuario: discord.Member):
     """Mostra histórico de progressão de um player (apenas administradores)"""
-    if not interaction.user.guild_permissions.administrator:
+    if not is_admin_user(interaction.user):
         await interaction.response.send_message(
             "❌ Apenas administradores podem usar este comando!",
             ephemeral=True
@@ -3686,6 +4287,992 @@ async def admin_progresso_player(interaction: discord.Interaction, usuario: disc
                 ephemeral=True
             )
 
+@bot.tree.command(name="admin_excluir_registro", description="[ADMIN] Exclui o registro de gearscore de um membro")
+@app_commands.describe(
+    usuario="Usuário do Discord para excluir o registro",
+    confirmar="Digite 'CONFIRMAR' para executar a exclusão (case-sensitive)"
+)
+@app_commands.default_permissions(administrator=True)
+async def admin_excluir_registro(interaction: discord.Interaction, usuario: discord.Member, confirmar: str):
+    """Exclui o registro de gearscore de um membro (apenas administradores)"""
+    if not is_admin_user(interaction.user):
+        await interaction.response.send_message(
+            "❌ Apenas administradores podem usar este comando!",
+            ephemeral=True
+        )
+        return
+    
+    # Verificar confirmação
+    if confirmar != "CONFIRMAR":
+        await interaction.response.send_message(
+            "❌ **Operação não confirmada!**\n\n"
+            "Para excluir o registro, você precisa digitar exatamente `CONFIRMAR` no campo de confirmação.\n"
+            "⚠️ **Atenção:** Esta ação é **irreversível** e excluirá todos os dados e histórico do membro!",
+            ephemeral=True
+        )
+        return
+    
+    try:
+        await interaction.response.defer(ephemeral=True)
+        
+        user_id = str(usuario.id)
+        
+        # Buscar dados antes de excluir (para log)
+        current_data = db.get_user_current_data(user_id)
+        
+        # Excluir registro
+        success, message = db.delete_user_gearscore(user_id)
+        
+        if success:
+            logger.info(f"Comando /admin_excluir_registro executado por {interaction.user.display_name} (ID: {interaction.user.id}) - Excluiu registro de {usuario.display_name} (ID: {user_id})")
+            
+            # Remover cargo de registrado e adicionar cargo de não registrado
+            member = interaction.guild.get_member(usuario.id)
+            if member:
+                await update_registration_roles(member, False)
+            
+            await interaction.followup.send(
+                f"✅ **Registro excluído com sucesso!**\n\n"
+                f"👤 **Usuário:** {usuario.mention}\n"
+                f"📝 **Mensagem:** {message}\n\n"
+                f"⚠️ O membro precisará fazer um novo `/registro` para ter seus dados novamente.",
+                ephemeral=True
+            )
+        else:
+            await interaction.followup.send(
+                f"❌ **Erro ao excluir registro:**\n{message}",
+                ephemeral=True
+            )
+    
+    except Exception as e:
+        logger.error(f"Erro ao excluir registro: {str(e)}")
+        if interaction.response.is_done():
+            await interaction.followup.send(
+                f"❌ Erro ao excluir registro: {str(e)}",
+                ephemeral=True
+            )
+        else:
+            await interaction.response.send_message(
+                f"❌ Erro ao excluir registro: {str(e)}",
+                ephemeral=True
+            )
+
+@bot.tree.command(name="admin_alterar_registro", description="[ADMIN] Altera o registro de gearscore de um membro")
+@app_commands.describe(
+    usuario="Usuário do Discord para alterar o registro",
+    nome_familia="Novo nome da família (deixe vazio para manter atual)",
+    nome_personagem="Novo nome do personagem (deixe vazio para manter atual)",
+    classe_pvp="Nova classe PVP (deixe vazio para manter atual)",
+    ap="Novo AP (deixe vazio para manter atual)",
+    aap="Novo AAP (deixe vazio para manter atual)",
+    dp="Novo DP (deixe vazio para manter atual)",
+    linkgear="Novo link do gear (deixe vazio para manter atual)"
+)
+@app_commands.autocomplete(classe_pvp=classe_autocomplete)
+@app_commands.default_permissions(administrator=True)
+async def admin_alterar_registro(
+    interaction: discord.Interaction,
+    usuario: discord.Member,
+    nome_familia: str = None,
+    nome_personagem: str = None,
+    classe_pvp: str = None,
+    ap: int = None,
+    aap: int = None,
+    dp: int = None,
+    linkgear: str = None
+):
+    """Altera o registro de gearscore de um membro (apenas administradores)"""
+    if not is_admin_user(interaction.user):
+        await interaction.response.send_message(
+            "❌ Apenas administradores podem usar este comando!",
+            ephemeral=True
+        )
+        return
+    
+    # Verificar se pelo menos um campo foi fornecido
+    if all(v is None for v in [nome_familia, nome_personagem, classe_pvp, ap, aap, dp, linkgear]):
+        await interaction.response.send_message(
+            "❌ Você precisa fornecer pelo menos um campo para alterar!",
+            ephemeral=True
+        )
+        return
+    
+    # Validar classe PVP se fornecida
+    if classe_pvp is not None and classe_pvp not in BDO_CLASSES:
+        classes_str = ", ".join(BDO_CLASSES[:10])
+        await interaction.response.send_message(
+            f"❌ Classe inválida! Classes disponíveis: {classes_str}... (use autocomplete para ver todas)",
+            ephemeral=True
+        )
+        return
+    
+    # Validar valores numéricos se fornecidos
+    if ap is not None and ap < 0:
+        await interaction.response.send_message("❌ O valor de AP deve ser positivo!", ephemeral=True)
+        return
+    if aap is not None and aap < 0:
+        await interaction.response.send_message("❌ O valor de AAP deve ser positivo!", ephemeral=True)
+        return
+    if dp is not None and dp < 0:
+        await interaction.response.send_message("❌ O valor de DP deve ser positivo!", ephemeral=True)
+        return
+    
+    try:
+        await interaction.response.defer(ephemeral=True)
+        
+        user_id = str(usuario.id)
+        
+        # Buscar dados atuais para mostrar no log
+        current_data = db.get_user_current_data(user_id)
+        if not current_data:
+            await interaction.followup.send(
+                f"❌ {usuario.mention} não possui registro de gearscore!\n"
+                f"Use `/registro_manual` para criar um novo registro.",
+                ephemeral=True
+            )
+            return
+        
+        old_family_name, old_character_name, old_class_pvp = current_data
+        
+        # Atualizar registro
+        success, message = db.admin_update_gearscore(
+            user_id=user_id,
+            family_name=nome_familia,
+            character_name=nome_personagem,
+            class_pvp=classe_pvp,
+            ap=ap,
+            aap=aap,
+            dp=dp,
+            linkgear=linkgear
+        )
+        
+        if success:
+            # Montar lista de campos alterados
+            changed_fields = []
+            if nome_familia is not None:
+                changed_fields.append(f"Nome Família: {old_family_name} → {nome_familia}")
+            if nome_personagem is not None:
+                changed_fields.append(f"Nome Personagem: {old_character_name or 'N/A'} → {nome_personagem}")
+            if classe_pvp is not None:
+                changed_fields.append(f"Classe: {old_class_pvp} → {classe_pvp}")
+            if ap is not None:
+                changed_fields.append(f"AP: {ap}")
+            if aap is not None:
+                changed_fields.append(f"AAP: {aap}")
+            if dp is not None:
+                changed_fields.append(f"DP: {dp}")
+            if linkgear is not None:
+                changed_fields.append(f"LinkGear: atualizado")
+            
+            # Atualizar nickname se o nome de família foi alterado
+            if nome_familia is not None:
+                member = interaction.guild.get_member(usuario.id)
+                if member:
+                    nick_success, nick_msg = await update_member_nickname(member, nome_familia)
+                    if nick_success:
+                        changed_fields.append(f"Nickname: atualizado para {nome_familia}")
+                    else:
+                        changed_fields.append(f"Nickname: não atualizado ({nick_msg})")
+            
+            logger.info(f"Comando /admin_alterar_registro executado por {interaction.user.display_name} (ID: {interaction.user.id}) - Alterou registro de {usuario.display_name} (ID: {user_id})")
+            
+            await interaction.followup.send(
+                f"✅ **Registro alterado com sucesso!**\n\n"
+                f"👤 **Usuário:** {usuario.mention}\n"
+                f"📝 **Alterações:**\n" + "\n".join([f"• {field}" for field in changed_fields]) + "\n\n"
+                f"📊 **Resultado:** {message}",
+                ephemeral=True
+            )
+        else:
+            await interaction.followup.send(
+                f"❌ **Erro ao alterar registro:**\n{message}",
+                ephemeral=True
+            )
+    
+    except Exception as e:
+        logger.error(f"Erro ao alterar registro: {str(e)}")
+        if interaction.response.is_done():
+            await interaction.followup.send(
+                f"❌ Erro ao alterar registro: {str(e)}",
+                ephemeral=True
+            )
+        else:
+            await interaction.response.send_message(
+                f"❌ Erro ao alterar registro: {str(e)}",
+                ephemeral=True
+            )
+
+@bot.tree.command(name="admin_sincronizar_nomes", description="[ADMIN] Sincroniza os nicknames de todos os membros com seus nomes de família")
+@app_commands.default_permissions(administrator=True)
+async def admin_sincronizar_nomes(interaction: discord.Interaction):
+    """Sincroniza os nicknames de todos os membros registrados com seus nomes de família (apenas administradores)"""
+    if not is_admin_user(interaction.user):
+        await interaction.response.send_message(
+            "❌ Apenas administradores podem usar este comando!",
+            ephemeral=True
+        )
+        return
+    
+    try:
+        await interaction.response.defer(ephemeral=True)
+        
+        if not interaction.guild:
+            await interaction.followup.send(
+                "❌ Este comando só pode ser usado em um servidor!",
+                ephemeral=True
+            )
+            return
+        
+        # Buscar apenas membros que têm o cargo da guilda
+        valid_user_ids = await get_guild_member_ids(interaction.guild)
+        
+        if not valid_user_ids:
+            await interaction.followup.send(
+                "❌ Nenhum membro com o cargo da guilda encontrado!",
+                ephemeral=True
+            )
+            return
+        
+        # Buscar todos os registros do banco de dados
+        all_registered = db.get_all_gearscores(valid_user_ids=valid_user_ids)
+        
+        if not all_registered:
+            await interaction.followup.send(
+                "❌ Nenhum registro de gearscore encontrado!",
+                ephemeral=True
+            )
+            return
+        
+        # Contadores
+        success_count = 0
+        error_count = 0
+        skipped_count = 0
+        errors_detail = []
+        
+        # Atualizar nickname de cada membro
+        for record in all_registered:
+            # Extrair dados do registro
+            if isinstance(record, dict):
+                user_id = record.get('user_id', '')
+                family_name = record.get('family_name', '')
+            else:
+                # Ordem das colunas: id(0), user_id(1), family_name(2), character_name(3), class_pvp(4), ap(5), aap(6), dp(7), linkgear(8), updated_at(9)
+                user_id = record[1] if len(record) > 1 else ''
+                family_name = record[2] if len(record) > 2 else ''
+            
+            if not user_id or not family_name:
+                skipped_count += 1
+                continue
+            
+            # Buscar membro no servidor
+            try:
+                member = interaction.guild.get_member(int(user_id))
+                if not member:
+                    skipped_count += 1
+                    continue
+                
+                # Verificar se já tem o nickname correto
+                if member.nick == family_name:
+                    skipped_count += 1
+                    continue
+                
+                # Atualizar nickname
+                nick_success, nick_msg = await update_member_nickname(member, family_name)
+                if nick_success:
+                    success_count += 1
+                else:
+                    error_count += 1
+                    if len(errors_detail) < 10:  # Limitar detalhes de erro
+                        errors_detail.append(f"{member.display_name}: {nick_msg}")
+            except Exception as e:
+                error_count += 1
+                if len(errors_detail) < 10:
+                    errors_detail.append(f"ID {user_id}: {str(e)}")
+        
+        # Criar embed de resultado
+        embed = discord.Embed(
+            title="✅ Sincronização de Nicknames Concluída!",
+            color=discord.Color.green() if error_count == 0 else discord.Color.orange(),
+            timestamp=discord.utils.utcnow()
+        )
+        
+        embed.add_field(
+            name="📊 Resultado",
+            value=f"✅ **Atualizados:** {success_count}\n"
+                  f"⏭️ **Ignorados:** {skipped_count} (já estavam corretos ou não encontrados)\n"
+                  f"❌ **Erros:** {error_count}",
+            inline=False
+        )
+        
+        if errors_detail:
+            embed.add_field(
+                name="⚠️ Detalhes dos Erros",
+                value="\n".join(errors_detail[:10]),
+                inline=False
+            )
+        
+        embed.set_footer(text=f"Executado por {interaction.user.display_name}")
+        
+        logger.info(f"Comando /admin_sincronizar_nomes executado por {interaction.user.display_name} (ID: {interaction.user.id}) - Sucesso: {success_count}, Erros: {error_count}, Ignorados: {skipped_count}")
+        
+        await interaction.followup.send(embed=embed, ephemeral=True)
+    
+    except Exception as e:
+        logger.error(f"Erro ao sincronizar nomes: {str(e)}")
+        if interaction.response.is_done():
+            await interaction.followup.send(
+                f"❌ Erro ao sincronizar nomes: {str(e)}",
+                ephemeral=True
+            )
+        else:
+            await interaction.response.send_message(
+                f"❌ Erro ao sincronizar nomes: {str(e)}",
+                ephemeral=True
+            )
+
+# ============================================
+# COMANDOS DE INTEGRAÇÃO COM APOLLO (GS EVENTO)
+# ============================================
+
+@bot.tree.command(name="gs_evento", description="[ADMIN] Busca o GS dos participantes de um evento do Apollo")
+@app_commands.describe(
+    mensagem_id="ID da mensagem do Apollo (clique direito na mensagem > Copiar ID)"
+)
+@app_commands.default_permissions(administrator=True)
+async def gs_evento(interaction: discord.Interaction, mensagem_id: str):
+    """Busca o GS dos participantes listados em uma mensagem do Apollo"""
+    if not is_admin_user(interaction.user):
+        await interaction.response.send_message(
+            "❌ Apenas administradores podem usar este comando!",
+            ephemeral=True
+        )
+        return
+    
+    try:
+        await interaction.response.defer(ephemeral=True)
+        
+        # Buscar a mensagem
+        try:
+            message_id = int(mensagem_id.strip())
+            message = await interaction.channel.fetch_message(message_id)
+        except ValueError:
+            await interaction.followup.send(
+                "❌ ID da mensagem inválido! Deve ser um número.",
+                ephemeral=True
+            )
+            return
+        except discord.NotFound:
+            await interaction.followup.send(
+                "❌ Mensagem não encontrada! Certifique-se de usar o comando no mesmo canal da mensagem.",
+                ephemeral=True
+            )
+            return
+        
+        # Extrair nomes dos embeds do Apollo
+        all_names = []
+        roles_data = {}  # {role_name: [names]}
+        
+        if message.embeds:
+            for embed in message.embeds:
+                # Extrair do título ou descrição
+                if embed.description:
+                    # Processar descrição linha por linha
+                    for line in embed.description.split('\n'):
+                        line = line.strip()
+                        if line and not line.startswith(('🔒', '📅', '⏰', '🕐', '@', 'http', '[Add')):
+                            # Limpar emojis e formatação
+                            clean_name = line.strip('🔴🟢🟡⚪🔵⚫👤📍✅❌⭐🛡️⚔️🏹🔮💚🧡💜💙❤️🖤🤍💛 *_~`>')
+                            clean_name = clean_name.strip()
+                            if clean_name and len(clean_name) > 1 and not clean_name.startswith(('@', 'http')):
+                                all_names.append(clean_name)
+                
+                # Extrair dos fields
+                for field in embed.fields:
+                    field_name = field.name.strip()
+                    field_value = field.value.strip()
+                    
+                    # Extrair nomes do valor do field
+                    names_in_field = []
+                    for line in field_value.split('\n'):
+                        line = line.strip()
+                        if line and not line.startswith(('🔒', '@', 'http', '[Add', '`')):
+                            # Limpar emojis e formatação
+                            clean_name = line.strip('🔴🟢🟡⚪🔵⚫👤📍✅❌⭐🛡️⚔️🏹🔮💚🧡💜💙❤️🖤🤍💛 *_~`>-•')
+                            clean_name = clean_name.strip()
+                            if clean_name and len(clean_name) > 1 and not clean_name.startswith(('@', 'http')):
+                                names_in_field.append(clean_name)
+                                all_names.append(clean_name)
+                    
+                    if names_in_field:
+                        # Limpar nome do field
+                        clean_field_name = field_name.strip('🔴🟢🟡⚪🔵⚫👤📍✅❌⭐🛡️⚔️🏹🔮💚🧡💜💙❤️🖤🤍💛🗡️ *_~`()0123456789/')
+                        clean_field_name = clean_field_name.strip()
+                        if clean_field_name:
+                            if clean_field_name not in roles_data:
+                                roles_data[clean_field_name] = []
+                            roles_data[clean_field_name].extend(names_in_field)
+        
+        if not all_names:
+            await interaction.followup.send(
+                "❌ Não foi possível extrair nomes da mensagem. Certifique-se de que é uma mensagem do Apollo com participantes.",
+                ephemeral=True
+            )
+            return
+        
+        # Remover duplicatas mantendo ordem
+        unique_names = list(dict.fromkeys(all_names))
+        
+        # Buscar GS de cada nome
+        gs_results = db.get_gearscores_by_family_names(unique_names)
+        
+        # Calcular estatísticas
+        found_players = []
+        not_found_players = []
+        total_gs = 0
+        
+        for name in unique_names:
+            result = gs_results.get(name.lower())
+            if result:
+                # Ordem: id(0), user_id(1), family_name(2), character_name(3), class_pvp(4), ap(5), aap(6), dp(7)
+                ap = result[5]
+                aap = result[6]
+                dp = result[7]
+                gs = max(ap, aap) + dp
+                class_pvp = result[4]
+                found_players.append({
+                    'name': result[2],  # family_name original do banco
+                    'gs': gs,
+                    'class': class_pvp,
+                    'ap': ap,
+                    'aap': aap,
+                    'dp': dp
+                })
+                total_gs += gs
+            else:
+                not_found_players.append(name)
+        
+        # Criar embed de resultado
+        embed = discord.Embed(
+            title="📊 GS dos Participantes - Evento Apollo",
+            color=discord.Color.blue(),
+            timestamp=discord.utils.utcnow()
+        )
+        
+        # Estatísticas gerais
+        avg_gs = total_gs // len(found_players) if found_players else 0
+        embed.add_field(
+            name="📈 Estatísticas",
+            value=f"**Total encontrados:** {len(found_players)}/{len(unique_names)}\n"
+                  f"**Média GS:** {avg_gs}\n"
+                  f"**Não registrados:** {len(not_found_players)}",
+            inline=False
+        )
+        
+        # Se temos dados por função (do Apollo)
+        if roles_data:
+            for role_name, role_names in roles_data.items():
+                role_text = ""
+                role_gs_total = 0
+                role_count = 0
+                
+                for name in role_names:
+                    result = gs_results.get(name.lower())
+                    if result:
+                        ap = result[5]
+                        aap = result[6]
+                        dp = result[7]
+                        gs = max(ap, aap) + dp
+                        class_pvp = result[4]
+                        role_text += f"• **{result[2]}** - {gs} GS ({class_pvp})\n"
+                        role_gs_total += gs
+                        role_count += 1
+                    else:
+                        role_text += f"• ~~{name}~~ - *Não registrado*\n"
+                
+                if role_text:
+                    role_avg = role_gs_total // role_count if role_count > 0 else 0
+                    # Limitar tamanho do field
+                    if len(role_text) > 1000:
+                        role_text = role_text[:997] + "..."
+                    embed.add_field(
+                        name=f"{role_name} (Média: {role_avg} GS)",
+                        value=role_text,
+                        inline=False
+                    )
+        else:
+            # Listar todos ordenados por GS
+            found_players.sort(key=lambda x: x['gs'], reverse=True)
+            
+            players_text = ""
+            for i, player in enumerate(found_players[:25], 1):  # Limitar a 25
+                players_text += f"**{i}.** {player['name']} - **{player['gs']}** GS ({player['class']})\n"
+            
+            if players_text:
+                embed.add_field(
+                    name="🏆 Ranking por GS",
+                    value=players_text[:1024],
+                    inline=False
+                )
+        
+        # Listar não encontrados
+        if not_found_players:
+            not_found_text = ", ".join(not_found_players[:20])
+            if len(not_found_players) > 20:
+                not_found_text += f"... (+{len(not_found_players) - 20})"
+            embed.add_field(
+                name="❌ Não Registrados",
+                value=not_found_text[:1024],
+                inline=False
+            )
+        
+        embed.set_footer(text=f"Consultado por {interaction.user.display_name}")
+        
+        await interaction.followup.send(embed=embed, ephemeral=True)
+        
+    except Exception as e:
+        logger.error(f"Erro ao buscar GS do evento: {str(e)}")
+        import traceback
+        logger.error(traceback.format_exc())
+        if interaction.response.is_done():
+            await interaction.followup.send(
+                f"❌ Erro ao buscar GS do evento: {str(e)}",
+                ephemeral=True
+            )
+        else:
+            await interaction.response.send_message(
+                f"❌ Erro ao buscar GS do evento: {str(e)}",
+                ephemeral=True
+            )
+
+# Modal para colar lista de nomes
+class GSListaModal(discord.ui.Modal, title="📋 Buscar GS por Lista de Nomes"):
+    nomes = discord.ui.TextInput(
+        label="Nomes dos jogadores (um por linha)",
+        style=discord.TextStyle.paragraph,
+        placeholder="DaVila\nArehasa\nXr\nWendellNog",
+        required=True,
+        max_length=2000
+    )
+    
+    async def on_submit(self, interaction: discord.Interaction):
+        await interaction.response.defer(ephemeral=True)
+        
+        # Processar nomes
+        names_list = [n.strip() for n in self.nomes.value.split('\n') if n.strip()]
+        
+        if not names_list:
+            await interaction.followup.send("❌ Nenhum nome fornecido!", ephemeral=True)
+            return
+        
+        # Buscar GS de cada nome
+        gs_results = db.get_gearscores_by_family_names(names_list)
+        
+        # Calcular estatísticas
+        found_players = []
+        not_found_players = []
+        total_gs = 0
+        
+        for name in names_list:
+            result = gs_results.get(name.lower())
+            if result:
+                ap = result[5]
+                aap = result[6]
+                dp = result[7]
+                gs = max(ap, aap) + dp
+                class_pvp = result[4]
+                found_players.append({
+                    'name': result[2],
+                    'gs': gs,
+                    'class': class_pvp
+                })
+                total_gs += gs
+            else:
+                not_found_players.append(name)
+        
+        # Ordenar por GS
+        found_players.sort(key=lambda x: x['gs'], reverse=True)
+        
+        # Criar embed
+        embed = discord.Embed(
+            title="📊 GS dos Jogadores",
+            color=discord.Color.blue(),
+            timestamp=discord.utils.utcnow()
+        )
+        
+        avg_gs = total_gs // len(found_players) if found_players else 0
+        embed.add_field(
+            name="📈 Estatísticas",
+            value=f"**Encontrados:** {len(found_players)}/{len(names_list)}\n"
+                  f"**Média GS:** {avg_gs}\n"
+                  f"**Não registrados:** {len(not_found_players)}",
+            inline=False
+        )
+        
+        # Listar jogadores
+        players_text = ""
+        for i, player in enumerate(found_players, 1):
+            players_text += f"**{i}.** {player['name']} - **{player['gs']}** GS ({player['class']})\n"
+        
+        if players_text:
+            # Dividir em múltiplos fields se necessário
+            if len(players_text) > 1024:
+                parts = [players_text[i:i+1024] for i in range(0, len(players_text), 1024)]
+                for idx, part in enumerate(parts[:3]):  # Máximo 3 parts
+                    embed.add_field(
+                        name=f"🏆 Ranking" + (f" (cont. {idx+1})" if idx > 0 else ""),
+                        value=part,
+                        inline=False
+                    )
+            else:
+                embed.add_field(name="🏆 Ranking por GS", value=players_text, inline=False)
+        
+        if not_found_players:
+            not_found_text = ", ".join(not_found_players[:15])
+            if len(not_found_players) > 15:
+                not_found_text += f"... (+{len(not_found_players) - 15})"
+            embed.add_field(name="❌ Não Registrados", value=not_found_text, inline=False)
+        
+        embed.set_footer(text=f"Consultado por {interaction.user.display_name}")
+        
+        await interaction.followup.send(embed=embed, ephemeral=True)
+
+@bot.tree.command(name="gs_lista", description="[ADMIN] Busca o GS de uma lista de jogadores (cole os nomes)")
+@app_commands.default_permissions(administrator=True)
+async def gs_lista(interaction: discord.Interaction):
+    """Abre um modal para colar uma lista de nomes e buscar o GS de cada um"""
+    if not is_admin_user(interaction.user):
+        await interaction.response.send_message(
+            "❌ Apenas administradores podem usar este comando!",
+            ephemeral=True
+        )
+        return
+    
+    await interaction.response.send_modal(GSListaModal())
+
+@bot.tree.command(name="gs_media", description="[ADMIN] Calcula a média de GS de uma lista de jogadores")
+@app_commands.describe(
+    nomes="Nomes dos jogadores separados por vírgula (ex: DaVila, Arehasa, Xr)"
+)
+@app_commands.default_permissions(administrator=True)
+async def gs_media(interaction: discord.Interaction, nomes: str):
+    """Calcula a média de GS de uma lista de jogadores pelo nome de família"""
+    if not is_admin_user(interaction.user):
+        await interaction.response.send_message(
+            "❌ Apenas administradores podem usar este comando!",
+            ephemeral=True
+        )
+        return
+    
+    try:
+        await interaction.response.defer(ephemeral=True)
+        
+        # Processar nomes (separados por vírgula ou quebra de linha)
+        names_list = []
+        for part in nomes.replace('\n', ',').split(','):
+            name = part.strip()
+            if name:
+                names_list.append(name)
+        
+        if not names_list:
+            await interaction.followup.send("❌ Nenhum nome fornecido!", ephemeral=True)
+            return
+        
+        # Buscar GS de cada nome
+        gs_results = db.get_gearscores_by_family_names(names_list)
+        
+        # Calcular estatísticas
+        found_players = []
+        not_found_players = []
+        total_gs = 0
+        
+        for name in names_list:
+            result = gs_results.get(name.lower())
+            if result:
+                ap = result[5]
+                aap = result[6]
+                dp = result[7]
+                gs = max(ap, aap) + dp
+                class_pvp = result[4]
+                found_players.append({
+                    'name': result[2],
+                    'gs': gs,
+                    'class': class_pvp,
+                    'ap': ap,
+                    'aap': aap,
+                    'dp': dp
+                })
+                total_gs += gs
+            else:
+                not_found_players.append(name)
+        
+        if not found_players:
+            await interaction.followup.send(
+                f"❌ Nenhum dos jogadores foi encontrado no banco de dados!\n"
+                f"**Nomes buscados:** {', '.join(names_list)}",
+                ephemeral=True
+            )
+            return
+        
+        # Calcular médias
+        avg_gs = total_gs // len(found_players)
+        avg_ap = sum(p['ap'] for p in found_players) // len(found_players)
+        avg_aap = sum(p['aap'] for p in found_players) // len(found_players)
+        avg_dp = sum(p['dp'] for p in found_players) // len(found_players)
+        
+        # Encontrar maior e menor GS
+        found_players.sort(key=lambda x: x['gs'], reverse=True)
+        highest = found_players[0]
+        lowest = found_players[-1]
+        
+        # Criar embed
+        embed = discord.Embed(
+            title="📊 Média de GS do Grupo",
+            color=discord.Color.gold(),
+            timestamp=discord.utils.utcnow()
+        )
+        
+        # Estatísticas principais
+        embed.add_field(
+            name="📈 Média Geral",
+            value=f"**{avg_gs}** GS\n({avg_ap}/{avg_aap}/{avg_dp})",
+            inline=True
+        )
+        
+        embed.add_field(
+            name="👥 Jogadores",
+            value=f"**{len(found_players)}** encontrados\n**{len(not_found_players)}** não registrados",
+            inline=True
+        )
+        
+        embed.add_field(
+            name="📉 Variação",
+            value=f"🔺 Maior: **{highest['gs']}** ({highest['name']})\n"
+                  f"🔻 Menor: **{lowest['gs']}** ({lowest['name']})",
+            inline=True
+        )
+        
+        # Lista de jogadores
+        players_text = ""
+        for player in found_players:
+            diff = player['gs'] - avg_gs
+            diff_str = f"+{diff}" if diff >= 0 else str(diff)
+            players_text += f"• **{player['name']}** - {player['gs']} GS ({diff_str})\n"
+        
+        if len(players_text) > 1024:
+            players_text = players_text[:1020] + "..."
+        
+        embed.add_field(
+            name="🎮 Jogadores (ordenado por GS)",
+            value=players_text,
+            inline=False
+        )
+        
+        # Não encontrados
+        if not_found_players:
+            not_found_text = ", ".join(not_found_players)
+            if len(not_found_text) > 200:
+                not_found_text = not_found_text[:200] + "..."
+            embed.add_field(
+                name="❌ Não Registrados",
+                value=not_found_text,
+                inline=False
+            )
+        
+        embed.set_footer(text=f"Consultado por {interaction.user.display_name}")
+        
+        await interaction.followup.send(embed=embed, ephemeral=True)
+        
+    except Exception as e:
+        logger.error(f"Erro ao calcular média de GS: {str(e)}")
+        if interaction.response.is_done():
+            await interaction.followup.send(
+                f"❌ Erro ao calcular média: {str(e)}",
+                ephemeral=True
+            )
+        else:
+            await interaction.response.send_message(
+                f"❌ Erro ao calcular média: {str(e)}",
+                ephemeral=True
+            )
+
+@bot.tree.command(name="gs_abaixo_media", description="[ADMIN] Lista players abaixo do GS médio da guilda")
+@app_commands.default_permissions(administrator=True)
+async def gs_abaixo_media(interaction: discord.Interaction):
+    """Lista todos os players que estão abaixo do GS médio da guilda com suas builds"""
+    if not is_admin_user(interaction.user):
+        await interaction.response.send_message(
+            "❌ Apenas administradores podem usar este comando!",
+            ephemeral=True
+        )
+        return
+    
+    try:
+        await interaction.response.defer(ephemeral=True)
+        
+        if not interaction.guild:
+            await interaction.followup.send(
+                "❌ Este comando só pode ser usado em um servidor!",
+                ephemeral=True
+            )
+            return
+        
+        # Buscar apenas membros que têm o cargo da guilda
+        valid_user_ids = await get_guild_member_ids(interaction.guild)
+        
+        if not valid_user_ids:
+            await interaction.followup.send(
+                "❌ Nenhum membro com o cargo da guilda encontrado!",
+                ephemeral=True
+            )
+            return
+        
+        # Buscar todos os gearscores
+        all_gearscores = db.get_all_gearscores(valid_user_ids=valid_user_ids)
+        
+        if not all_gearscores:
+            await interaction.followup.send(
+                "❌ Nenhum gearscore cadastrado ainda!",
+                ephemeral=True
+            )
+            return
+        
+        # Processar dados e calcular GS médio
+        players_data = []
+        total_gs = 0
+        
+        for record in all_gearscores:
+            # Extrair dados do registro
+            if isinstance(record, dict):
+                user_id = record.get('user_id', '')
+                family_name = record.get('family_name', '')
+                class_pvp = record.get('class_pvp', '')
+                ap = record.get('ap', 0)
+                aap = record.get('aap', 0)
+                dp = record.get('dp', 0)
+            else:
+                # Ordem: id(0), user_id(1), family_name(2), character_name(3), class_pvp(4), ap(5), aap(6), dp(7), linkgear(8), updated_at(9)
+                user_id = record[1] if len(record) > 1 else ''
+                family_name = record[2] if len(record) > 2 else ''
+                class_pvp = record[4] if len(record) > 4 else ''
+                ap = record[5] if len(record) > 5 else 0
+                aap = record[6] if len(record) > 6 else 0
+                dp = record[7] if len(record) > 7 else 0
+            
+            gs = max(ap, aap) + dp
+            
+            # Buscar membro para verificar se ainda tem cargo
+            try:
+                member = interaction.guild.get_member(int(user_id))
+                if not member or not has_guild_role(member):
+                    continue  # Pular se não tem cargo
+            except (ValueError, AttributeError):
+                continue  # Pular se não conseguir verificar
+            
+            players_data.append({
+                'user_id': user_id,
+                'family_name': family_name,
+                'class_pvp': class_pvp,
+                'ap': ap,
+                'aap': aap,
+                'dp': dp,
+                'gs': gs
+            })
+            total_gs += gs
+        
+        if not players_data:
+            await interaction.followup.send(
+                "❌ Nenhum player com cargo da guilda encontrado!",
+                ephemeral=True
+            )
+            return
+        
+        # Calcular GS médio
+        avg_gs = total_gs // len(players_data)
+        
+        # Filtrar players abaixo da média
+        players_abaixo = [
+            p for p in players_data
+            if p['gs'] < avg_gs
+        ]
+        
+        # Ordenar por GS (menor primeiro)
+        players_abaixo.sort(key=lambda x: x['gs'])
+        
+        if not players_abaixo:
+            await interaction.followup.send(
+                f"✅ **Todos os players estão acima ou na média!**\n\n"
+                f"📊 **GS Médio da Guilda:** {avg_gs}\n"
+                f"👥 **Total de players:** {len(players_data)}",
+                ephemeral=True
+            )
+            return
+        
+        # Criar embed
+        embed = discord.Embed(
+            title="📉 Players Abaixo do GS Médio",
+            description=f"GS Médio da Guilda: **{avg_gs}**\n"
+                        f"Total de players: **{len(players_data)}**\n"
+                        f"Players abaixo da média: **{len(players_abaixo)}** ({len(players_abaixo)/len(players_data)*100:.1f}%)",
+            color=discord.Color.orange(),
+            timestamp=discord.utils.utcnow()
+        )
+        
+        # Criar lista de players
+        players_text = ""
+        for i, player in enumerate(players_abaixo, 1):
+            diff = avg_gs - player['gs']
+            players_text += f"**{i}.** {player['family_name']} ({player['class_pvp']})\n"
+            players_text += f"   GS: **{player['gs']}** (-{diff}) | Build: {player['ap']}/{player['aap']}/{player['dp']}\n\n"
+        
+        # Dividir em múltiplos campos se necessário
+        if len(players_text) > 1024:
+            parts = []
+            current_part = ""
+            
+            for i, player in enumerate(players_abaixo, 1):
+                diff = avg_gs - player['gs']
+                line = f"**{i}.** {player['family_name']} ({player['class_pvp']})\n"
+                line += f"   GS: **{player['gs']}** (-{diff}) | Build: {player['ap']}/{player['aap']}/{player['dp']}\n\n"
+                
+                if len(current_part + line) > 1024:
+                    if current_part:
+                        parts.append(current_part)
+                    current_part = line
+                else:
+                    current_part += line
+            
+            if current_part:
+                parts.append(current_part)
+            
+            # Adicionar campos
+            for idx, part in enumerate(parts[:5]):  # Máximo 5 campos
+                field_name = "👥 Players Abaixo da Média" if idx == 0 else f"👥 Players (cont. {idx+1})"
+                embed.add_field(name=field_name, value=part[:1024], inline=False)
+        else:
+            embed.add_field(
+                name="👥 Players Abaixo da Média",
+                value=players_text,
+                inline=False
+            )
+        
+        embed.set_footer(text=f"Consultado por {interaction.user.display_name}")
+        
+        await interaction.followup.send(embed=embed, ephemeral=True)
+        
+    except Exception as e:
+        import traceback
+        logger.error(f"Erro ao buscar players abaixo da média: {traceback.format_exc()}")
+        if interaction.response.is_done():
+            await interaction.followup.send(
+                f"❌ Erro ao buscar players abaixo da média: {str(e)}",
+                ephemeral=True
+            )
+        else:
+            await interaction.response.send_message(
+                f"❌ Erro ao buscar players abaixo da média: {str(e)}",
+                ephemeral=True
+            )
+
 # Comando comentado temporariamente
 # @bot.tree.command(name="admin_limpar_banco", description="[ADMIN] Limpa o banco de dados (CUIDADO: Irreversível!)")
 # @app_commands.describe(
@@ -3752,25 +5339,6 @@ async def admin_progresso_player(interaction: discord.Interaction, usuario: disc
 #                 f"❌ Erro ao limpar banco de dados: {str(e)}",
 #                 ephemeral=True
 #             )
-        
-    except Exception as e:
-        import traceback
-        error_details = traceback.format_exc()
-        logger.error(f"Erro ao buscar histórico: {error_details}")
-        
-        # Verificar se já respondeu
-        if interaction.response.is_done():
-            await interaction.followup.send(
-                f"❌ Erro ao buscar histórico: {str(e)}\n\n"
-                f"**Detalhes técnicos:** Verifique os logs do bot para mais informações.",
-                ephemeral=True
-            )
-        else:
-            await interaction.response.send_message(
-                f"❌ Erro ao buscar histórico: {str(e)}\n\n"
-                f"**Detalhes técnicos:** Verifique os logs do bot para mais informações.",
-                ephemeral=True
-            )
 
 @bot.tree.command(name="analise_classe", description="[ADMIN] Análise completa de uma classe com relatório detalhado de todos os membros")
 @app_commands.describe(
@@ -3780,7 +5348,7 @@ async def admin_progresso_player(interaction: discord.Interaction, usuario: disc
 @app_commands.default_permissions(administrator=True)
 async def analise_classe(interaction: discord.Interaction, classe: str):
     """Análise completa de uma classe com relatório detalhado de todos os membros (apenas administradores)"""
-    if not interaction.user.guild_permissions.administrator:
+    if not is_admin_user(interaction.user):
         await interaction.response.send_message(
             "❌ Apenas administradores podem usar este comando!",
             ephemeral=True
@@ -3976,7 +5544,7 @@ async def analise_classe(interaction: discord.Interaction, classe: str):
 @app_commands.default_permissions(administrator=True)
 async def admin_membros_sem_registro(interaction: discord.Interaction):
     """Lista membros com cargo da guilda que ainda não fizeram registro (apenas administradores)"""
-    if not interaction.user.guild_permissions.administrator:
+    if not is_admin_user(interaction.user):
         await interaction.response.send_message(
             "❌ Apenas administradores podem usar este comando!",
             ephemeral=True
@@ -4092,7 +5660,7 @@ async def admin_membros_sem_registro(interaction: discord.Interaction):
 @app_commands.default_permissions(administrator=True)
 async def admin_enviar_lembretes(interaction: discord.Interaction):
     """Envia lembretes de atualização de GS manualmente (apenas administradores)"""
-    if not interaction.user.guild_permissions.administrator:
+    if not is_admin_user(interaction.user):
         await interaction.response.send_message(
             "❌ Apenas administradores podem usar este comando!",
             ephemeral=True
@@ -4143,7 +5711,7 @@ async def admin_enviar_lembretes(interaction: discord.Interaction):
 @app_commands.default_permissions(administrator=True)
 async def admin_gs_desatualizados(interaction: discord.Interaction, dias: int = None):
     """Lista membros que não atualizaram GS há X dias (apenas administradores)"""
-    if not interaction.user.guild_permissions.administrator:
+    if not is_admin_user(interaction.user):
         await interaction.response.send_message(
             "❌ Apenas administradores podem usar este comando!",
             ephemeral=True
@@ -4307,4 +5875,3 @@ if __name__ == "__main__":
         except Exception as e:
             logger.critical(f"Erro fatal ao iniciar bot: {e}")
             raise
-
