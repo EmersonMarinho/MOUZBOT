@@ -21,6 +21,11 @@ build/
 .env
 .env.local
 
+# Google Sheets credentials
+credentials.json
+*.json
+!package.json
+
 # IDE
 .vscode/
 .idea/

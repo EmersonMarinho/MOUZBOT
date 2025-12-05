@@ -289,6 +289,88 @@ class Database:
             print(f"Aviso ao criar índices de eventos: {e}")
             conn.rollback()
         
+        # Tabela de eventos de censo
+        try:
+            cursor.execute('''
+                CREATE TABLE IF NOT EXISTS censo_events (
+                    id SERIAL PRIMARY KEY,
+                    nome TEXT NOT NULL,
+                    data_limite TIMESTAMP NOT NULL,
+                    criado_por TEXT NOT NULL,
+                    criado_por_nome TEXT,
+                    ativo BOOLEAN DEFAULT TRUE,
+                    campos_json JSONB,
+                    exemplos_json JSONB,
+                    created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+                )
+            ''')
+            
+            # Adicionar coluna campos_json se não existir (migração)
+            try:
+                cursor.execute('''
+                    SELECT column_name 
+                    FROM information_schema.columns 
+                    WHERE table_name = 'censo_events' AND column_name = 'campos_json'
+                ''')
+                if not cursor.fetchone():
+                    cursor.execute('''
+                        ALTER TABLE censo_events 
+                        ADD COLUMN campos_json JSONB
+                    ''')
+            except Exception as e:
+                print(f"Aviso ao adicionar campos_json: {e}")
+                conn.rollback()
+            
+            # Adicionar coluna exemplos_json se não existir (migração)
+            try:
+                cursor.execute('''
+                    SELECT column_name 
+                    FROM information_schema.columns 
+                    WHERE table_name = 'censo_events' AND column_name = 'exemplos_json'
+                ''')
+                if not cursor.fetchone():
+                    cursor.execute('''
+                        ALTER TABLE censo_events 
+                        ADD COLUMN exemplos_json JSONB
+                    ''')
+            except Exception as e:
+                print(f"Aviso ao adicionar exemplos_json: {e}")
+                conn.rollback()
+        except Exception as e:
+            print(f"Aviso ao criar tabela censo_events: {e}")
+            conn.rollback()
+        
+        # Tabela de respostas do censo
+        try:
+            cursor.execute('''
+                CREATE TABLE IF NOT EXISTS censo_responses (
+                    id SERIAL PRIMARY KEY,
+                    censo_id INTEGER NOT NULL REFERENCES censo_events(id) ON DELETE CASCADE,
+                    user_id TEXT NOT NULL,
+                    family_name TEXT,
+                    dados_json JSONB NOT NULL,
+                    preenchido_em TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                    UNIQUE(censo_id, user_id)
+                )
+            ''')
+        except Exception as e:
+            print(f"Aviso ao criar tabela censo_responses: {e}")
+            conn.rollback()
+        
+        # Índices para censo
+        try:
+            cursor.execute('''
+                CREATE INDEX IF NOT EXISTS idx_censo_events_ativo 
+                ON censo_events(ativo, data_limite)
+            ''')
+            cursor.execute('''
+                CREATE INDEX IF NOT EXISTS idx_censo_responses_censo 
+                ON censo_responses(censo_id, user_id)
+            ''')
+        except Exception as e:
+            print(f"Aviso ao criar índices de censo: {e}")
+            conn.rollback()
+        
         try:
             conn.commit()
         except Exception as e:
@@ -975,6 +1057,293 @@ class Database:
             cursor.close()
             conn.close()
             return deleted
+        except Exception as e:
+            conn.rollback()
+            cursor.close()
+            conn.close()
+            raise e
+    
+    # ==================== MÉTODOS DE CENSO ====================
+    
+    def criar_censo(self, nome: str, data_limite, criado_por: str, criado_por_nome: str, campos_json=None, exemplos_json=None):
+        """Cria um novo evento de censo"""
+        import json
+        conn = self.get_connection()
+        cursor = conn.cursor()
+        
+        try:
+            # Desativar censos anteriores
+            cursor.execute('''
+                UPDATE censo_events SET ativo = FALSE WHERE ativo = TRUE
+            ''')
+            
+            # Converter campos_json para string JSON se for lista/dict
+            if campos_json:
+                if isinstance(campos_json, (list, dict)):
+                    campos_json_str = json.dumps(campos_json, ensure_ascii=False)
+                else:
+                    campos_json_str = campos_json
+            else:
+                campos_json_str = None
+            
+            # Converter exemplos_json para string JSON
+            if exemplos_json:
+                if isinstance(exemplos_json, dict):
+                    exemplos_json_str = json.dumps(exemplos_json, ensure_ascii=False)
+                else:
+                    exemplos_json_str = exemplos_json
+            else:
+                exemplos_json_str = None
+            
+            # Verificar se a coluna exemplos_json existe, se não, adicionar
+            try:
+                cursor.execute('''
+                    SELECT column_name 
+                    FROM information_schema.columns 
+                    WHERE table_name = 'censo_events' AND column_name = 'exemplos_json'
+                ''')
+                if not cursor.fetchone():
+                    cursor.execute('''
+                        ALTER TABLE censo_events 
+                        ADD COLUMN exemplos_json JSONB
+                    ''')
+                    conn.commit()
+            except Exception as e:
+                print(f"Aviso ao verificar/adicionar exemplos_json: {e}")
+                conn.rollback()
+            
+            # Criar novo censo (com ou sem exemplos_json dependendo se a coluna existe)
+            try:
+                cursor.execute('''
+                    INSERT INTO censo_events (nome, data_limite, criado_por, criado_por_nome, ativo, campos_json, exemplos_json)
+                    VALUES (%s, %s, %s, %s, TRUE, %s::jsonb, %s::jsonb)
+                    RETURNING id
+                ''', (nome, data_limite, criado_por, criado_por_nome, campos_json_str, exemplos_json_str))
+            except:
+                # Se falhar (coluna não existe), inserir sem exemplos_json
+                conn.rollback()
+                cursor.execute('''
+                    INSERT INTO censo_events (nome, data_limite, criado_por, criado_por_nome, ativo, campos_json)
+                    VALUES (%s, %s, %s, %s, TRUE, %s::jsonb)
+                    RETURNING id
+                ''', (nome, data_limite, criado_por, criado_por_nome, campos_json_str))
+            
+            censo_id = cursor.fetchone()[0]
+            conn.commit()
+            cursor.close()
+            conn.close()
+            return censo_id
+        except Exception as e:
+            conn.rollback()
+            cursor.close()
+            conn.close()
+            raise e
+    
+    def get_censo_ativo(self):
+        """Retorna o censo ativo atual, ou None se não houver"""
+        import json
+        conn = self.get_connection()
+        cursor = conn.cursor()
+        
+        try:
+            # Verificar se a coluna exemplos_json existe
+            try:
+                cursor.execute('''
+                    SELECT column_name 
+                    FROM information_schema.columns 
+                    WHERE table_name = 'censo_events' AND column_name = 'exemplos_json'
+                ''')
+                has_exemplos_col = cursor.fetchone() is not None
+            except Exception as e:
+                # Se der erro, assumir que não existe
+                conn.rollback()
+                has_exemplos_col = False
+            
+            # Buscar censo com ou sem exemplos_json
+            if has_exemplos_col:
+                cursor.execute('''
+                    SELECT id, nome, data_limite, criado_por, criado_por_nome, created_at, campos_json, exemplos_json
+                    FROM censo_events
+                    WHERE ativo = TRUE
+                    ORDER BY created_at DESC
+                    LIMIT 1
+                ''')
+            else:
+                cursor.execute('''
+                    SELECT id, nome, data_limite, criado_por, criado_por_nome, created_at, campos_json
+                    FROM censo_events
+                    WHERE ativo = TRUE
+                    ORDER BY created_at DESC
+                    LIMIT 1
+                ''')
+            
+            result = cursor.fetchone()
+            cursor.close()
+            conn.close()
+            
+            if result:
+                campos = None
+                if result[6]:
+                    if isinstance(result[6], str):
+                        campos = json.loads(result[6])
+                    else:
+                        campos = result[6]
+                
+                exemplos = None
+                if has_exemplos_col and len(result) > 7 and result[7]:
+                    if isinstance(result[7], str):
+                        exemplos = json.loads(result[7])
+                    else:
+                        exemplos = result[7]
+                
+                return {
+                    'id': result[0],
+                    'nome': result[1],
+                    'data_limite': result[2],
+                    'criado_por': result[3],
+                    'criado_por_nome': result[4],
+                    'created_at': result[5],
+                    'campos': campos,
+                    'exemplos': exemplos
+                }
+            return None
+        except Exception as e:
+            conn.rollback()
+            cursor.close()
+            conn.close()
+            raise e
+    
+    def salvar_resposta_censo(self, censo_id: int, user_id: str, family_name: str, dados: dict):
+        """Salva ou atualiza a resposta de um player ao censo"""
+        import json
+        conn = self.get_connection()
+        cursor = conn.cursor()
+        
+        try:
+            dados_json = json.dumps(dados, ensure_ascii=False)
+            cursor.execute('''
+                INSERT INTO censo_responses (censo_id, user_id, family_name, dados_json)
+                VALUES (%s, %s, %s, %s::jsonb)
+                ON CONFLICT (censo_id, user_id)
+                DO UPDATE SET 
+                    family_name = EXCLUDED.family_name,
+                    dados_json = EXCLUDED.dados_json,
+                    preenchido_em = CURRENT_TIMESTAMP
+            ''', (censo_id, user_id, family_name, dados_json))
+            
+            conn.commit()
+            cursor.close()
+            conn.close()
+            return True
+        except Exception as e:
+            conn.rollback()
+            cursor.close()
+            conn.close()
+            raise e
+    
+    def get_resposta_censo(self, censo_id: int, user_id: str):
+        """Retorna a resposta de um player ao censo, ou None se não preencheu"""
+        import json
+        conn = self.get_connection()
+        cursor = conn.cursor()
+        
+        try:
+            cursor.execute('''
+                SELECT dados_json, preenchido_em, family_name
+                FROM censo_responses
+                WHERE censo_id = %s AND user_id = %s
+            ''', (censo_id, user_id))
+            
+            result = cursor.fetchone()
+            cursor.close()
+            conn.close()
+            
+            if result:
+                return {
+                    'dados': json.loads(result[0]) if isinstance(result[0], str) else result[0],
+                    'preenchido_em': result[1],
+                    'family_name': result[2]
+                }
+            return None
+        except Exception as e:
+            cursor.close()
+            conn.close()
+            raise e
+    
+    def get_players_com_censo(self, censo_id: int):
+        """Retorna lista de user_ids que preencheram o censo"""
+        conn = self.get_connection()
+        cursor = conn.cursor()
+        
+        try:
+            cursor.execute('''
+                SELECT user_id, family_name, preenchido_em
+                FROM censo_responses
+                WHERE censo_id = %s
+            ''', (censo_id,))
+            
+            results = cursor.fetchall()
+            cursor.close()
+            conn.close()
+            
+            return [{'user_id': row[0], 'family_name': row[1], 'preenchido_em': row[2]} for row in results]
+        except Exception as e:
+            cursor.close()
+            conn.close()
+            raise e
+    
+    def get_todas_respostas_censo(self, censo_id: int):
+        """Retorna todas as respostas do censo com dados completos"""
+        import json
+        conn = self.get_connection()
+        cursor = conn.cursor()
+        
+        try:
+            cursor.execute('''
+                SELECT user_id, family_name, dados_json, preenchido_em
+                FROM censo_responses
+                WHERE censo_id = %s
+                ORDER BY preenchido_em ASC
+            ''', (censo_id,))
+            
+            results = cursor.fetchall()
+            cursor.close()
+            conn.close()
+            
+            respostas = []
+            for row in results:
+                try:
+                    dados = json.loads(row[2]) if isinstance(row[2], str) else row[2]
+                except:
+                    dados = {}
+                
+                respostas.append({
+                    'user_id': row[0],
+                    'family_name': row[1],
+                    'dados': dados,
+                    'preenchido_em': row[3]
+                })
+            
+            return respostas
+        except Exception as e:
+            cursor.close()
+            conn.close()
+            raise e
+    
+    def finalizar_censo(self, censo_id: int):
+        """Finaliza um censo (desativa)"""
+        conn = self.get_connection()
+        cursor = conn.cursor()
+        
+        try:
+            cursor.execute('''
+                UPDATE censo_events SET ativo = FALSE WHERE id = %s
+            ''', (censo_id,))
+            
+            conn.commit()
+            cursor.close()
+            conn.close()
+            return True
         except Exception as e:
             conn.rollback()
             cursor.close()

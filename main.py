@@ -6,7 +6,7 @@ import io
 import logging
 from datetime import datetime
 from pytz import timezone
-from config import DISCORD_TOKEN, BDO_CLASSES, DATABASE_NAME, DATABASE_URL, ALLOWED_DM_ROLES, NOTIFICATION_CHANNEL_ID, GUILD_MEMBER_ROLE_ID, DM_REPORT_CHANNEL_ID, LIST_CHANNEL_ID, MOVE_LOG_CHANNEL_ID, REGISTERED_ROLE_ID, UNREGISTERED_ROLE_ID, GS_UPDATE_REMINDER_DAYS, GS_REMINDER_CHECK_HOUR, ADMIN_USER_IDS
+from config import DISCORD_TOKEN, BDO_CLASSES, DATABASE_NAME, DATABASE_URL, ALLOWED_DM_ROLES, NOTIFICATION_CHANNEL_ID, GUILD_MEMBER_ROLE_ID, DM_REPORT_CHANNEL_ID, LIST_CHANNEL_ID, MOVE_LOG_CHANNEL_ID, REGISTERED_ROLE_ID, UNREGISTERED_ROLE_ID, GS_UPDATE_REMINDER_DAYS, GS_REMINDER_CHECK_HOUR, ADMIN_USER_IDS, CENSO_COMPLETO_ROLE_ID, SEM_CENSO_ROLE_ID, GOOGLE_SHEETS_ENABLED, GOOGLE_SHEETS_SPREADSHEET_ID, GOOGLE_SHEETS_WORKSHEET_NAME, GOOGLE_SHEETS_CREDENTIALS_PATH
 from datetime import timedelta
 # Importar o banco de dados apropriado
 if DATABASE_URL:
@@ -65,6 +65,199 @@ logger = logging.getLogger(__name__)
 # Inicializar banco de dados
 db = Database()
 logger.info("Banco de dados inicializado")
+
+# Verificar se Google Sheets está disponível
+GOOGLE_SHEETS_AVAILABLE = False
+if GOOGLE_SHEETS_ENABLED:
+    try:
+        import gspread
+        from google.oauth2.service_account import Credentials
+        GOOGLE_SHEETS_AVAILABLE = True
+        logger.info("Integração com Google Sheets habilitada")
+    except ImportError:
+        logger.warning("Biblioteca gspread não instalada. Integração com Google Sheets desabilitada.")
+        GOOGLE_SHEETS_AVAILABLE = False
+
+# Função helper para enviar dados para Google Sheets
+async def enviar_para_google_sheets(censo_data: dict, user_display_name: str, timestamp, campos: list = None):
+    """Envia dados do censo para Google Sheets usando campos personalizados"""
+    if not GOOGLE_SHEETS_ENABLED or not GOOGLE_SHEETS_AVAILABLE:
+        return False
+    
+    try:
+        if not GOOGLE_SHEETS_SPREADSHEET_ID:
+            logger.warning("GOOGLE_SHEETS_SPREADSHEET_ID não configurado")
+            return False
+        
+        import gspread
+        from google.oauth2.service_account import Credentials
+        
+        # Autenticar
+        scope = ['https://spreadsheets.google.com/feeds',
+                 'https://www.googleapis.com/auth/drive']
+        
+        if not os.path.exists(GOOGLE_SHEETS_CREDENTIALS_PATH):
+            logger.error(f"Arquivo de credenciais não encontrado: {GOOGLE_SHEETS_CREDENTIALS_PATH}")
+            return False
+        
+        creds = Credentials.from_service_account_file(
+            GOOGLE_SHEETS_CREDENTIALS_PATH, 
+            scopes=scope
+        )
+        client = gspread.authorize(creds)
+        
+        # Abrir planilha
+        spreadsheet = client.open_by_key(GOOGLE_SHEETS_SPREADSHEET_ID)
+        
+        # Selecionar ou criar worksheet
+        try:
+            worksheet = spreadsheet.worksheet(GOOGLE_SHEETS_WORKSHEET_NAME)
+        except gspread.exceptions.WorksheetNotFound:
+            worksheet = spreadsheet.add_worksheet(
+                title=GOOGLE_SHEETS_WORKSHEET_NAME, 
+                rows=1000, 
+                cols=20
+            )
+            logger.info(f"Worksheet '{GOOGLE_SHEETS_WORKSHEET_NAME}' criada")
+        
+        # Usar campos personalizados ou campos padrão
+        if not campos:
+            campos = list(censo_data.keys())
+        
+        # Criar cabeçalhos: Data/Hora, Nome Discord, Nome de Família, e depois os campos personalizados
+        # Remover "Nome Discord" dos campos se estiver duplicado
+        campos_sem_duplicado = [c for c in campos if c != 'Nome Discord']
+        headers = ['Data/Hora', 'Nome Discord', 'Nome de Família'] + campos_sem_duplicado
+        
+        # Verificar se já tem cabeçalhos
+        try:
+            all_values = worksheet.get_all_values()
+            logger.info(f"Valores atuais na planilha: {len(all_values)} linhas")
+            
+            if not all_values or len(all_values) == 0:
+                # Planilha vazia, adicionar cabeçalhos
+                worksheet.insert_row(headers, 1)
+                logger.info(f"Cabeçalhos adicionados (planilha vazia): {headers}")
+            else:
+                first_row = all_values[0]
+                logger.info(f"Primeira linha encontrada: {first_row}")
+                
+                if not first_row or first_row[0] != 'Data/Hora':
+                    # Adicionar cabeçalhos se não existirem
+                    worksheet.insert_row(headers, 1)
+                    logger.info(f"Cabeçalhos adicionados: {headers}")
+                else:
+                    # Verificar se os cabeçalhos precisam ser atualizados
+                    if len(first_row) != len(headers) or first_row != headers:
+                        logger.info(f"Cabeçalhos diferentes detectados. Atualizando...")
+                        logger.info(f"  - Cabeçalhos atuais: {first_row}")
+                        logger.info(f"  - Cabeçalhos esperados: {headers}")
+                        # Atualizar cabeçalhos se diferentes
+                        worksheet.delete_rows(1)
+                        worksheet.insert_row(headers, 1)
+                        logger.info(f"Cabeçalhos atualizados: {headers}")
+                    else:
+                        logger.info(f"Cabeçalhos já estão corretos: {headers}")
+        except Exception as e:
+            logger.warning(f"Erro ao verificar/atualizar cabeçalhos: {e}")
+            import traceback
+            logger.error(traceback.format_exc())
+            # Tentar adicionar cabeçalhos mesmo assim
+            try:
+                worksheet.insert_row(headers, 1)
+                logger.info(f"Cabeçalhos adicionados após erro: {headers}")
+            except Exception as e2:
+                logger.error(f"Erro ao adicionar cabeçalhos após erro inicial: {e2}")
+        
+        # Preparar dados para inserir
+        sao_paulo_tz = timezone('America/Sao_Paulo')
+        if isinstance(timestamp, str):
+            timestamp = datetime.fromisoformat(timestamp)
+        if timestamp.tzinfo is None:
+            timestamp = sao_paulo_tz.localize(timestamp)
+        
+        # Buscar nome de família dos dados ou do censo_data
+        family_name = censo_data.get('family_name') or censo_data.get('nome_familia') or ''
+        
+        # Criar row_data: Data/Hora, Nome Discord, Nome de Família, e depois valores dos campos
+        row_data = [
+            timestamp.strftime('%d/%m/%Y %H:%M:%S'),
+            user_display_name,
+            family_name
+        ]
+        
+        # Mapear campos da estrutura fixa para os dados
+        campo_mapping = {
+            'Nome Discord': 'nome_discord',
+            'Classe': 'classe',
+            'Awk/Succ': 'awk_succ',
+            'AP MAIN': 'ap_main',
+            'AP AWK': 'ap_awk',
+            'Defesa': 'defesa',
+            'Edania': 'edania',
+            'Funções': 'funcoes',
+            'Gear Image': 'gear_image_url',
+            'Passiva Node Image': 'passiva_node_image_url'
+        }
+        
+        # Adicionar valores dos campos na ordem definida
+        for campo in campos:
+            # Verificar se é campo da estrutura fixa
+            if campo in campo_mapping:
+                chave_dados = campo_mapping[campo]
+                valor = censo_data.get(chave_dados, '')
+                
+                # Processar valores especiais
+                if chave_dados == 'funcoes' and isinstance(valor, list):
+                    valor = ', '.join([f.replace("nao", "Não").title() for f in valor])
+                elif valor is None:
+                    valor = ''
+                    
+                row_data.append(str(valor) if valor else '')
+            else:
+                # Campo personalizado (buscar direto)
+                valor = censo_data.get(campo, '')
+                row_data.append(str(valor) if valor else '')
+        
+        # Log detalhado antes de adicionar
+        logger.info(f"Preparando para adicionar linha no Google Sheets:")
+        logger.info(f"  - Planilha ID: {GOOGLE_SHEETS_SPREADSHEET_ID}")
+        logger.info(f"  - Worksheet: {GOOGLE_SHEETS_WORKSHEET_NAME}")
+        logger.info(f"  - Dados: {row_data}")
+        logger.info(f"  - Total de colunas: {len(row_data)}")
+        logger.info(f"  - Censo data keys: {list(censo_data.keys())}")
+        
+        # Adicionar linha
+        try:
+            # Verificar número de linhas antes
+            num_rows_before = len(worksheet.get_all_values())
+            logger.info(f"Linhas na planilha antes: {num_rows_before}")
+            
+            worksheet.append_row(row_data)
+            
+            # Verificar número de linhas depois
+            num_rows_after = len(worksheet.get_all_values())
+            logger.info(f"Linhas na planilha depois: {num_rows_after}")
+            
+            if num_rows_after > num_rows_before:
+                logger.info(f"✅ Linha adicionada com sucesso no Google Sheets! (Linha {num_rows_after})")
+            else:
+                logger.warning(f"⚠️ Linha pode não ter sido adicionada (antes: {num_rows_before}, depois: {num_rows_after})")
+                
+        except Exception as append_error:
+            logger.error(f"❌ Erro ao adicionar linha: {append_error}")
+            import traceback
+            logger.error(traceback.format_exc())
+            raise
+        
+        logger.info(f"Dados do censo enviados para Google Sheets: {user_display_name} ({len(campos)} campos)")
+        return True
+        
+    except Exception as e:
+        logger.error(f"Erro ao enviar para Google Sheets: {e}")
+        import traceback
+        logger.error(traceback.format_exc())
+        return False
 
 # Função helper para calcular GS corretamente (MAX(AP, AAP) + DP)
 def calculate_gs(ap, aap, dp):
@@ -5863,6 +6056,1414 @@ async def admin_gs_desatualizados(interaction: discord.Interaction, dias: int = 
                 f"❌ Erro ao buscar membros desatualizados: {str(e)}",
                 ephemeral=True
             )
+
+# ==================== SISTEMA DE CENSO ====================
+
+# Modal para criar censo com campos personalizados
+class CriarCensoModal(discord.ui.Modal, title="📋 Criar Censo"):
+    def __init__(self, exemplos: dict = None):
+        super().__init__()
+        self.exemplos = exemplos or {}
+    
+    nome = discord.ui.TextInput(
+        label="Nome do Censo",
+        placeholder="Ex: Censo Q1 2024",
+        required=True,
+        max_length=100
+    )
+    
+    data_limite = discord.ui.TextInput(
+        label="Data Limite (DD/MM/YYYY HH:MM)",
+        placeholder="31/12/2024 23:59",
+        required=True,
+        max_length=20
+    )
+    
+    campos = discord.ui.TextInput(
+        label="Campos do Censo (um por linha) - OPCIONAL",
+        placeholder="Deixe vazio para estrutura fixa. Ou defina: Nome, Classe, GS, etc.",
+        style=discord.TextStyle.paragraph,
+        required=False,
+        max_length=1000
+    )
+    
+    async def on_submit(self, interaction: discord.Interaction):
+        try:
+            await interaction.response.defer(ephemeral=True)
+            
+            # Parse da data
+            try:
+                from datetime import datetime
+                data_limite_dt = datetime.strptime(self.data_limite.value, "%d/%m/%Y %H:%M")
+                sao_paulo_tz = timezone('America/Sao_Paulo')
+                data_limite_dt = sao_paulo_tz.localize(data_limite_dt)
+            except ValueError:
+                await interaction.followup.send(
+                    "❌ Formato de data inválido! Use: DD/MM/YYYY HH:MM\n"
+                    "Exemplo: 31/12/2024 23:59",
+                    ephemeral=True
+                )
+                return
+            
+            # Verificar se a data não é no passado
+            if data_limite_dt < datetime.now(sao_paulo_tz):
+                await interaction.followup.send(
+                    "❌ A data limite não pode ser no passado!",
+                    ephemeral=True
+                )
+                return
+            
+            # Processar campos (um por linha, remover vazios)
+            # Se vazio, usar estrutura fixa (None = estrutura fixa)
+            campos_list = None
+            if self.campos.value and self.campos.value.strip():
+                campos_list = [c.strip() for c in self.campos.value.split('\n') if c.strip()]
+                if not campos_list:
+                    campos_list = None
+            
+            # Criar censo com campos e exemplos de imagens
+            censo_id = db.criar_censo(
+                self.nome.value,
+                data_limite_dt,
+                str(interaction.user.id),
+                interaction.user.display_name,
+                campos_json=campos_list,
+                exemplos_json=self.exemplos if self.exemplos else None
+            )
+            
+            # Aplicar tag "Sem Censo" em todos os membros registrados
+            valid_user_ids = await get_guild_member_ids(interaction.guild)
+            members_with_registry = set()
+            
+            if valid_user_ids:
+                all_registered = db.get_all_gearscores(valid_user_ids=valid_user_ids)
+                for record in all_registered:
+                    if isinstance(record, dict):
+                        user_id = record.get('user_id', '')
+                    else:
+                        user_id = record[1] if len(record) > 1 else ''
+                    if user_id:
+                        members_with_registry.add(str(user_id))
+            
+            # Aplicar tags
+            sem_censo_role = interaction.guild.get_role(SEM_CENSO_ROLE_ID) if SEM_CENSO_ROLE_ID else None
+            applied = 0
+            errors = 0
+            
+            if sem_censo_role:
+                for user_id in members_with_registry:
+                    member = interaction.guild.get_member(int(user_id))
+                    if member and sem_censo_role not in member.roles:
+                        try:
+                            await member.add_roles(sem_censo_role, reason=f"Censo criado: {self.nome.value}")
+                            applied += 1
+                        except:
+                            errors += 1
+            
+            embed = discord.Embed(
+                title="✅ Censo Criado com Sucesso!",
+                description=f"O censo **{self.nome.value}** foi criado e está ativo.",
+                color=discord.Color.green(),
+                timestamp=discord.utils.utcnow()
+            )
+            embed.add_field(
+                name="📅 Data Limite",
+                value=f"<t:{int(data_limite_dt.timestamp())}:F>",
+                inline=False
+            )
+            if campos_list:
+                embed.add_field(
+                    name="📋 Campos Personalizados",
+                    value="\n".join([f"• {campo}" for campo in campos_list]),
+                    inline=False
+                )
+            else:
+                estrutura_texto = "Estrutura fixa padrão:\n• Nome Discord (automático)\n• Classe (dropdown)\n• Awakening/Succession (dropdown)\n• AP MAIN\n• AP AWK\n• Defesa\n• Armaduras de Edania (dropdown)\n• Print da Gear\n• Print da Passiva do Node\n• Funções (dropdown múltipla)"
+                if self.exemplos:
+                    estrutura_texto += "\n\n📷 **Imagens de exemplo anexadas!**"
+                embed.add_field(
+                    name="📋 Estrutura",
+                    value=estrutura_texto,
+                    inline=False
+                )
+            
+            # Adicionar imagens de exemplo se houver
+            if self.exemplos.get('gear'):
+                embed.set_image(url=self.exemplos['gear'])
+                embed.add_field(
+                    name="📷 Exemplo - Print da Gear",
+                    value="Esta imagem será mostrada como exemplo para os players",
+                    inline=False
+                )
+            if self.exemplos.get('passiva'):
+                if not embed.image:
+                    embed.set_image(url=self.exemplos['passiva'])
+                embed.add_field(
+                    name="📷 Exemplo - Print da Passiva do Node",
+                    value="Esta imagem será mostrada como exemplo para os players",
+                    inline=False
+                )
+            embed.add_field(
+                name="👥 Tags Aplicadas",
+                value=f"**{applied}** membros receberam a tag 'Sem Censo'",
+                inline=False
+            )
+            if errors > 0:
+                embed.add_field(
+                    name="⚠️ Erros",
+                    value=f"{errors} tags não puderam ser aplicadas",
+                    inline=False
+                )
+            embed.set_footer(text=f"Criado por {interaction.user.display_name}")
+            
+            await interaction.followup.send(embed=embed, ephemeral=True)
+            if campos_list:
+                logger.info(f"Censo '{self.nome.value}' criado por {interaction.user.display_name} com {len(campos_list)} campos personalizados")
+            else:
+                logger.info(f"Censo '{self.nome.value}' criado por {interaction.user.display_name} com estrutura fixa padrão")
+            
+        except Exception as e:
+            logger.error(f"Erro ao criar censo: {e}")
+            import traceback
+            logger.error(traceback.format_exc())
+            if interaction.response.is_done():
+                await interaction.followup.send(
+                    f"❌ Erro ao criar censo: {str(e)}",
+                    ephemeral=True
+                )
+            else:
+                await interaction.response.send_message(
+                    f"❌ Erro ao criar censo: {str(e)}",
+                    ephemeral=True
+                )
+
+# View para preencher censo com estrutura específica
+class CensoView(discord.ui.View):
+    def __init__(self, censo_id: int):
+        super().__init__(timeout=1800)  # 30 minutos
+        self.censo_id = censo_id
+        self.dados = {
+            'nome_discord': None,  # Será preenchido automaticamente
+            'classe': None,
+            'awk_succ': None,
+            'ap_main': None,
+            'ap_awk': None,
+            'defesa': None,
+            'edania': None,
+            'gear_image_url': None,
+            'passiva_node_image_url': None,
+            'funcoes': []
+        }
+        self.images_sent = False
+        self.original_message = None  # Armazenar mensagem original para edição
+    
+    # Botão para selecionar classe (com autocomplete via modal)
+    @discord.ui.button(label="⚔️ Selecionar Classe", style=discord.ButtonStyle.primary, row=0)
+    async def selecionar_classe(self, interaction: discord.Interaction, button: discord.ui.Button):
+        modal = CensoClasseModal(self.dados, view=self)
+        await interaction.response.send_modal(modal)
+    
+    # Select para Awk/Succ
+    @discord.ui.select(
+        placeholder="🎭 Awakening ou Succession?",
+        options=[
+            discord.SelectOption(label="Awakening", value="Awakening", emoji="⚔️"),
+            discord.SelectOption(label="Succession", value="Succession", emoji="🛡️"),
+        ],
+        row=1
+    )
+    async def select_awk_succ(self, interaction: discord.Interaction, select: discord.ui.Select):
+        self.dados['awk_succ'] = select.values[0]
+        await interaction.response.send_message(
+            f"✅ Selecionado: **{select.values[0]}**",
+            ephemeral=True
+        )
+    
+    # Select para Edania
+    @discord.ui.select(
+        placeholder="🛡️ Quantas Armaduras de Edania?",
+        options=[
+            discord.SelectOption(label="0", value="0"),
+            discord.SelectOption(label="1", value="1"),
+            discord.SelectOption(label="2", value="2"),
+            discord.SelectOption(label="3", value="3"),
+            discord.SelectOption(label="4", value="4"),
+        ],
+        row=2
+    )
+    async def select_edania(self, interaction: discord.Interaction, select: discord.ui.Select):
+        self.dados['edania'] = select.values[0]
+        await interaction.response.send_message(
+            f"✅ Edania selecionado: **{select.values[0]}** peça(s)",
+            ephemeral=True
+        )
+    
+    # Select para Funções (múltipla escolha)
+    @discord.ui.select(
+        placeholder="⚙️ Funções (pode selecionar múltiplas)",
+        options=[
+            discord.SelectOption(label="Defesa", value="defesa", emoji="🛡️"),
+            discord.SelectOption(label="Flanco", value="flanco", emoji="⚔️"),
+            discord.SelectOption(label="Elefante", value="elefante", emoji="🐘"),
+            discord.SelectOption(label="Não", value="nao", emoji="❌"),
+        ],
+        min_values=1,
+        max_values=4,
+        row=3
+    )
+    async def select_funcoes(self, interaction: discord.Interaction, select: discord.ui.Select):
+        valores = select.values
+        
+        # Validação: não pode ter "não" junto com outras opções
+        if "nao" in valores and len(valores) > 1:
+            await interaction.response.send_message(
+                "❌ Você não pode selecionar 'Não' junto com outras funções!",
+                ephemeral=True
+            )
+            return
+        
+        self.dados['funcoes'] = valores
+        funcoes_texto = ", ".join([f.replace("nao", "Não").title() for f in valores])
+        await interaction.response.send_message(
+            f"✅ Funções selecionadas: **{funcoes_texto}**",
+            ephemeral=True
+        )
+    
+    # Botão para abrir modal com campos numéricos
+    @discord.ui.button(label="📝 Preencher AP e Defesa", style=discord.ButtonStyle.primary, row=4)
+    async def preencher_stats(self, interaction: discord.Interaction, button: discord.ui.Button):
+        modal = CensoStatsModal(self.dados)
+        await interaction.response.send_modal(modal)
+    
+    # Botão para enviar imagens
+    @discord.ui.button(label="📷 Enviar Imagens", style=discord.ButtonStyle.secondary, row=4)
+    async def enviar_imagens(self, interaction: discord.Interaction, button: discord.ui.Button):
+        modal = CensoImagesModal(self.dados)
+        await interaction.response.send_modal(modal)
+    
+    # Botão para finalizar
+    @discord.ui.button(label="✅ Finalizar Censo", style=discord.ButtonStyle.success, row=4)
+    async def finalizar_censo(self, interaction: discord.Interaction, button: discord.ui.Button):
+        await interaction.response.defer(ephemeral=True)
+        
+        # Validar campos obrigatórios
+        campos_faltando = []
+        if not self.dados['classe']:
+            campos_faltando.append("Classe")
+        if not self.dados['awk_succ']:
+            campos_faltando.append("Awakening/Succession")
+        if not self.dados['ap_main']:
+            campos_faltando.append("AP da MAIN")
+        if not self.dados['ap_awk']:
+            campos_faltando.append("AP da AWK")
+        if not self.dados['defesa']:
+            campos_faltando.append("Defesa")
+        if not self.dados['edania']:
+            campos_faltando.append("Armaduras de Edania")
+        if not self.dados['funcoes']:
+            campos_faltando.append("Funções")
+        if not self.dados['gear_image_url']:
+            campos_faltando.append("Print da Gear")
+        if not self.dados['passiva_node_image_url']:
+            campos_faltando.append("Print da Passiva do Node")
+        
+        if campos_faltando:
+            await interaction.followup.send(
+                f"❌ Por favor, preencha todos os campos!\n\n"
+                f"**Campos faltando:**\n" + "\n".join([f"• {campo}" for campo in campos_faltando]),
+                ephemeral=True
+            )
+            return
+        
+        # Salvar dados
+        try:
+            # Buscar dados do usuário (nome de família do registro)
+            user_data = db.get_user_current_data(str(interaction.user.id))
+            family_name = user_data[0] if user_data else interaction.user.display_name
+            
+            # Adicionar nome de família aos dados do censo
+            self.dados['family_name'] = family_name
+            
+            # Salvar resposta
+            db.salvar_resposta_censo(
+                self.censo_id,
+                str(interaction.user.id),
+                family_name,
+                self.dados
+            )
+            
+            # Atualizar tags
+            member = interaction.guild.get_member(interaction.user.id)
+            if member:
+                if SEM_CENSO_ROLE_ID:
+                    sem_censo_role = interaction.guild.get_role(SEM_CENSO_ROLE_ID)
+                    if sem_censo_role and sem_censo_role in member.roles:
+                        try:
+                            await member.remove_roles(sem_censo_role, reason="Censo preenchido")
+                        except:
+                            pass
+                
+                if CENSO_COMPLETO_ROLE_ID:
+                    censo_completo_role = interaction.guild.get_role(CENSO_COMPLETO_ROLE_ID)
+                    if censo_completo_role and censo_completo_role not in member.roles:
+                        try:
+                            await member.add_roles(censo_completo_role, reason="Censo preenchido")
+                        except:
+                            pass
+            
+            embed = discord.Embed(
+                title="✅ Censo Preenchido com Sucesso!",
+                description="Seu censo foi salvo com sucesso!",
+                color=discord.Color.green(),
+                timestamp=discord.utils.utcnow()
+            )
+            embed.add_field(name="👤 Nome Discord", value=interaction.user.display_name, inline=True)
+            embed.add_field(name="⚔️ Classe", value=self.dados['classe'], inline=True)
+            embed.add_field(name="🎭 Awk/Succ", value=self.dados['awk_succ'], inline=True)
+            embed.add_field(name="⚔️ AP MAIN", value=str(self.dados['ap_main']), inline=True)
+            embed.add_field(name="🔥 AP AWK", value=str(self.dados['ap_awk']), inline=True)
+            embed.add_field(name="🛡️ Defesa", value=str(self.dados['defesa']), inline=True)
+            embed.add_field(name="🛡️ Edania", value=f"{self.dados['edania']} peça(s)", inline=True)
+            funcoes_texto = ", ".join([f.replace("nao", "Não").title() for f in self.dados['funcoes']])
+            embed.add_field(name="⚙️ Funções", value=funcoes_texto, inline=False)
+            if self.dados['gear_image_url']:
+                embed.add_field(name="📷 Gear", value=f"[Ver Imagem]({self.dados['gear_image_url']})", inline=True)
+            if self.dados['passiva_node_image_url']:
+                embed.add_field(name="📷 Passiva Node", value=f"[Ver Imagem]({self.dados['passiva_node_image_url']})", inline=True)
+            embed.set_footer(text="Obrigado por preencher o censo!")
+            
+            await interaction.followup.send(embed=embed, ephemeral=True)
+            logger.info(f"Censo preenchido por {interaction.user.display_name} (ID: {interaction.user.id})")
+            
+            # Enviar para Google Sheets
+            if GOOGLE_SHEETS_ENABLED and GOOGLE_SHEETS_AVAILABLE:
+                sao_paulo_tz = timezone('America/Sao_Paulo')
+                timestamp = datetime.now(sao_paulo_tz)
+                
+                try:
+                    censo = db.get_censo_ativo()
+                    campos_censo = censo.get('campos', []) if censo else []
+                    
+                    # Se não houver campos personalizados, usar estrutura fixa
+                    if not campos_censo:
+                        campos_censo = [
+                            'Classe', 'Awk/Succ', 'AP MAIN', 
+                            'AP AWK', 'Defesa', 'Edania', 'Funções', 
+                            'Gear Image', 'Passiva Node Image'
+                        ]
+                    
+                    # Adicionar family_name aos dados
+                    dados_com_family = self.dados.copy()
+                    dados_com_family['family_name'] = family_name
+                    
+                    await enviar_para_google_sheets(
+                        dados_com_family,
+                        interaction.user.display_name,
+                        timestamp,
+                        campos_censo
+                    )
+                except Exception as e:
+                    logger.error(f"Erro ao enviar para Google Sheets (não crítico): {e}")
+            
+        except Exception as e:
+            logger.error(f"Erro ao salvar censo: {e}")
+            await interaction.followup.send(
+                f"❌ Erro ao salvar censo: {str(e)}",
+                ephemeral=True
+            )
+
+# Modal para preencher AP e Defesa
+class CensoStatsModal(discord.ui.Modal, title="📊 AP e Defesa"):
+    def __init__(self, dados: dict):
+        super().__init__()
+        self.dados = dados
+    
+    ap_main = discord.ui.TextInput(
+        label="AP da MAIN",
+        placeholder="Ex: 350",
+        required=True,
+        max_length=10
+    )
+    
+    ap_awk = discord.ui.TextInput(
+        label="AP da AWK",
+        placeholder="Ex: 360",
+        required=True,
+        max_length=10
+    )
+    
+    defesa = discord.ui.TextInput(
+        label="Defesa",
+        placeholder="Ex: 400",
+        required=True,
+        max_length=10
+    )
+    
+    async def on_submit(self, interaction: discord.Interaction):
+        try:
+            # Validar números
+            try:
+                self.dados['ap_main'] = int(self.ap_main.value.strip())
+                self.dados['ap_awk'] = int(self.ap_awk.value.strip())
+                self.dados['defesa'] = int(self.defesa.value.strip())
+            except ValueError:
+                await interaction.response.send_message(
+                    "❌ Por favor, digite apenas números!",
+                    ephemeral=True
+                )
+                return
+            
+            await interaction.response.send_message(
+                f"✅ Dados salvos!\n"
+                f"**AP MAIN:** {self.dados['ap_main']}\n"
+                f"**AP AWK:** {self.dados['ap_awk']}\n"
+                f"**Defesa:** {self.dados['defesa']}",
+                ephemeral=True
+            )
+        except Exception as e:
+            await interaction.response.send_message(
+                f"❌ Erro: {str(e)}",
+                ephemeral=True
+            )
+
+# Modal para selecionar classe (com todas as 30 classes)
+class CensoClasseModal(discord.ui.Modal, title="⚔️ Selecionar Classe"):
+    def __init__(self, dados: dict, view: discord.ui.View = None):
+        super().__init__()
+        self.dados = dados
+        self.view = view
+    
+    classe = discord.ui.TextInput(
+        label="Digite sua Classe (autocomplete ao digitar)",
+        placeholder="Digite o nome da classe (ex: Warrior, Ranger, Sorceress...)",
+        required=True,
+        max_length=30
+    )
+    
+    async def on_submit(self, interaction: discord.Interaction):
+        classe_value = self.classe.value.strip()
+        
+        # Normalizar: primeira letra maiúscula, resto minúscula
+        classe_value = classe_value.capitalize()
+        
+        # Verificar se a classe existe (case-insensitive)
+        classe_encontrada = None
+        for classe in BDO_CLASSES:
+            if classe.lower() == classe_value.lower():
+                classe_encontrada = classe
+                break
+        
+        # Se não encontrou exato, buscar similar
+        if not classe_encontrada:
+            # Buscar classes que contenham o texto digitado
+            sugestoes = [c for c in BDO_CLASSES if classe_value.lower() in c.lower()][:5]
+            
+            if sugestoes:
+                await interaction.response.send_message(
+                    f"❌ Classe não encontrada!\n\n"
+                    f"**Você digitou:** {self.classe.value}\n\n"
+                    f"**Sugestões:**\n" + "\n".join([f"• {c}" for c in sugestoes]) + "\n\n"
+                    f"Digite novamente com uma das classes acima.",
+                    ephemeral=True
+                )
+            else:
+                # Listar todas as classes disponíveis
+                classes_lista = ", ".join(BDO_CLASSES)
+                await interaction.response.send_message(
+                    f"❌ Classe não encontrada!\n\n"
+                    f"**Classes disponíveis:**\n{classes_lista}\n\n"
+                    f"Digite o nome exato de uma das classes acima.",
+                    ephemeral=True
+                )
+            return
+        
+        self.dados['classe'] = classe_encontrada
+        
+        # Atualizar o botão na view para mostrar a classe selecionada
+        if self.view:
+            for item in self.view.children:
+                if isinstance(item, discord.ui.Button) and ("Selecionar Classe" in item.label or "Classe:" in item.label):
+                    item.label = f"✅ Classe: {classe_encontrada}"
+                    item.style = discord.ButtonStyle.success
+                    item.disabled = False
+                    break
+        
+        # Atualizar a mensagem original para remover instruções desnecessárias
+        try:
+            # Usar a mensagem armazenada na view
+            if self.view and self.view.original_message:
+                embed = self.view.original_message.embeds[0] if self.view.original_message.embeds else None
+                if embed:
+                    # Atualizar descrição removendo instrução sobre classe
+                    desc = embed.description
+                    if desc:
+                        # Remover linha sobre selecionar classe
+                        linhas = desc.split('\n')
+                        novas_linhas = []
+                        for linha in linhas:
+                            if "Clique em 'Selecionar Classe'" not in linha and "1. Clique em 'Selecionar Classe'" not in linha and "**Classe selecionada:**" not in linha:
+                                novas_linhas.append(linha)
+                        embed.description = '\n'.join(novas_linhas)
+                        
+                        # Adicionar informação da classe selecionada no início
+                        if novas_linhas:
+                            embed.description = f"**Classe selecionada:** {classe_encontrada}\n\n" + embed.description
+                        else:
+                            embed.description = f"**Classe selecionada:** {classe_encontrada}"
+                    
+                    await self.view.original_message.edit(embed=embed, view=self.view)
+        except Exception as e:
+            logger.error(f"Erro ao atualizar mensagem: {e}")
+        
+        await interaction.response.send_message(
+            f"✅ Classe selecionada: **{classe_encontrada}**",
+            ephemeral=True
+        )
+
+# Modal para enviar links das imagens
+class CensoImagesModal(discord.ui.Modal, title="📷 Enviar Imagens"):
+    def __init__(self, dados: dict):
+        super().__init__()
+        self.dados = dados
+    
+    gear_image = discord.ui.TextInput(
+        label="Link Imgur - Print da Gear",
+        placeholder="https://imgur.com/abc123",
+        required=True,
+        max_length=500
+    )
+    
+    passiva_node_image = discord.ui.TextInput(
+        label="Link Imgur - Passiva do Node",
+        placeholder="https://imgur.com/xyz789",
+        required=True,
+        max_length=500
+    )
+    
+    async def on_submit(self, interaction: discord.Interaction):
+        # Validar URLs do Imgur
+        gear_url = self.gear_image.value.strip()
+        passiva_url = self.passiva_node_image.value.strip()
+        
+        # Validar se é URL do Imgur
+        def is_imgur_url(url):
+            """Verifica se a URL é do Imgur"""
+            if not url.startswith(('http://', 'https://')):
+                return False
+            # Aceitar diferentes formatos do Imgur
+            imgur_domains = [
+                'imgur.com',
+                'i.imgur.com',
+                'www.imgur.com'
+            ]
+            return any(domain in url.lower() for domain in imgur_domains)
+        
+        if not is_imgur_url(gear_url):
+            await interaction.response.send_message(
+                "❌ O link da Gear não é válido!\n\n"
+                "**Você precisa usar o Imgur para enviar a imagem:**\n"
+                "1. Acesse https://imgur.com/\n"
+                "2. Faça upload da sua imagem\n"
+                "3. Copie o link da imagem (ex: https://imgur.com/abc123)\n"
+                "4. Cole o link aqui\n\n"
+                "⚠️ Links do Discord não são aceitos. Use apenas Imgur!",
+                ephemeral=True
+            )
+            return
+        
+        if not is_imgur_url(passiva_url):
+            await interaction.response.send_message(
+                "❌ O link da Passiva do Node não é válido!\n\n"
+                "**Você precisa usar o Imgur para enviar a imagem:**\n"
+                "1. Acesse https://imgur.com/\n"
+                "2. Faça upload da sua imagem\n"
+                "3. Copie o link da imagem (ex: https://imgur.com/xyz789)\n"
+                "4. Cole o link aqui\n\n"
+                "⚠️ Links do Discord não são aceitos. Use apenas Imgur!",
+                ephemeral=True
+            )
+            return
+        
+        # Garantir que a URL está no formato correto (adicionar .jpg ou .png se necessário)
+        # Imgur aceita links diretos como https://i.imgur.com/ID.jpg
+        # Mas também aceita https://imgur.com/ID
+        # Vamos normalizar para garantir que funcione
+        if 'imgur.com/' in gear_url and not gear_url.endswith(('.jpg', '.jpeg', '.png', '.gif', '.webp')):
+            # Se não termina com extensão, pode ser um link de álbum ou página
+            # Vamos aceitar mesmo assim, mas avisar se necessário
+            pass
+        
+        if 'imgur.com/' in passiva_url and not passiva_url.endswith(('.jpg', '.jpeg', '.png', '.gif', '.webp')):
+            pass
+        
+        self.dados['gear_image_url'] = gear_url
+        self.dados['passiva_node_image_url'] = passiva_url
+        
+        await interaction.response.send_message(
+            "✅ Links das imagens do Imgur salvos com sucesso!\n\n"
+            "**Como usar o Imgur:**\n"
+            "1. Acesse https://imgur.com/\n"
+            "2. Clique em 'New post' ou arraste a imagem\n"
+            "3. Faça upload da sua imagem\n"
+            "4. Copie o link da página ou da imagem direta\n"
+            "5. Cole o link no formulário\n\n"
+            "💡 **Dica:** Use o link direto da imagem (i.imgur.com/ID.jpg) para melhor visualização!",
+            ephemeral=True
+        )
+
+# Modal para preencher o censo (dinâmico - mantido para compatibilidade)
+class CensoModal(discord.ui.Modal):
+    def __init__(self, censo_id: int, campos: list):
+        super().__init__(title="📋 Preencher Censo")
+        self.censo_id = censo_id
+        self.campos = campos
+        
+        # Criar campos dinamicamente
+        for i, campo in enumerate(campos):
+            campo_input = discord.ui.TextInput(
+                label=campo,
+                placeholder=f"Digite {campo.lower()}",
+                required=True,
+                max_length=500
+            )
+            setattr(self, f'campo_{i}', campo_input)
+            self.add_item(campo_input)
+    
+    async def on_submit(self, interaction: discord.Interaction):
+        try:
+            await interaction.response.defer(ephemeral=True)
+            
+            # Coletar valores dos campos dinâmicos
+            dados_censo = {}
+            for i, campo in enumerate(self.campos):
+                campo_value = getattr(self, f'campo_{i}').value
+                dados_censo[campo] = campo_value.strip() if campo_value else ''
+            
+            # Buscar dados do usuário para family_name (nome de família do registro)
+            user_data = db.get_user_current_data(str(interaction.user.id))
+            family_name = user_data[0] if user_data else interaction.user.display_name
+            
+            # Adicionar nome de família aos dados do censo
+            dados_censo['family_name'] = family_name
+            
+            # Salvar resposta
+            db.salvar_resposta_censo(
+                self.censo_id,
+                str(interaction.user.id),
+                family_name,
+                dados_censo
+            )
+            
+            # Atualizar tags
+            member = interaction.guild.get_member(interaction.user.id)
+            if member:
+                # Remover tag "Sem Censo" se tiver
+                if SEM_CENSO_ROLE_ID:
+                    sem_censo_role = interaction.guild.get_role(SEM_CENSO_ROLE_ID)
+                    if sem_censo_role and sem_censo_role in member.roles:
+                        try:
+                            await member.remove_roles(sem_censo_role, reason="Censo preenchido")
+                        except:
+                            pass
+                
+                # Adicionar tag "Censo Completo" se configurada
+                if CENSO_COMPLETO_ROLE_ID:
+                    censo_completo_role = interaction.guild.get_role(CENSO_COMPLETO_ROLE_ID)
+                    if censo_completo_role and censo_completo_role not in member.roles:
+                        try:
+                            await member.add_roles(censo_completo_role, reason="Censo preenchido")
+                        except:
+                            pass
+            
+            embed = discord.Embed(
+                title="✅ Censo Preenchido com Sucesso!",
+                description="Seu censo foi salvo com sucesso!",
+                color=discord.Color.green(),
+                timestamp=discord.utils.utcnow()
+            )
+            
+            # Adicionar campos dinamicamente ao embed (máximo 25 campos no Discord)
+            for i, campo in enumerate(self.campos[:24]):
+                valor = dados_censo.get(campo, 'N/A')
+                if len(str(valor)) > 1024:
+                    valor = str(valor)[:1021] + "..."
+                embed.add_field(name=campo, value=str(valor), inline=True)
+            
+            embed.set_footer(text="Obrigado por preencher o censo!")
+            
+            await interaction.followup.send(embed=embed, ephemeral=True)
+            logger.info(f"Censo preenchido por {interaction.user.display_name} (ID: {interaction.user.id})")
+            
+            # Buscar censo para obter campos
+            censo = db.get_censo_ativo()
+            campos_censo = censo.get('campos', list(dados_censo.keys())) if censo else list(dados_censo.keys())
+            
+            # Enviar para Google Sheets (se configurado) - em background
+            if GOOGLE_SHEETS_ENABLED and GOOGLE_SHEETS_AVAILABLE:
+                sao_paulo_tz = timezone('America/Sao_Paulo')
+                timestamp = datetime.now(sao_paulo_tz)
+                
+                try:
+                    await enviar_para_google_sheets(
+                        dados_censo,
+                        interaction.user.display_name,
+                        timestamp,
+                        campos_censo
+                    )
+                except Exception as e:
+                    logger.error(f"Erro ao enviar para Google Sheets (não crítico): {e}")
+                    # Não mostrar erro para o usuário, apenas logar
+            
+        except Exception as e:
+            logger.error(f"Erro ao preencher censo: {e}")
+            if interaction.response.is_done():
+                await interaction.followup.send(
+                    f"❌ Erro ao salvar censo: {str(e)}",
+                    ephemeral=True
+                )
+            else:
+                await interaction.response.send_message(
+                    f"❌ Erro ao salvar censo: {str(e)}",
+                    ephemeral=True
+                )
+
+@bot.tree.command(name="criar_censo", description="[ADMIN] Cria um novo evento de censo")
+@app_commands.describe(
+    exemplo_gear="Imagem de exemplo da Gear (anexe a imagem)",
+    exemplo_passiva="Imagem de exemplo da Passiva do Node (anexe a imagem)"
+)
+@app_commands.default_permissions(administrator=True)
+async def criar_censo(interaction: discord.Interaction, exemplo_gear: discord.Attachment = None, exemplo_passiva: discord.Attachment = None):
+    """Cria um novo evento de censo. Use estrutura fixa (deixe campos vazios) ou defina campos personalizados."""
+    if not is_admin_user(interaction.user):
+        await interaction.response.send_message(
+            "❌ Apenas administradores podem usar este comando!",
+            ephemeral=True
+        )
+        return
+    
+    # Se houver imagens de exemplo, salvar URLs
+    exemplos = {}
+    if exemplo_gear:
+        exemplos['gear'] = exemplo_gear.url
+    if exemplo_passiva:
+        exemplos['passiva'] = exemplo_passiva.url
+    
+    modal = CriarCensoModal(exemplos=exemplos)
+    await interaction.response.send_modal(modal)
+
+@bot.tree.command(name="preencher_censo", description="Preenche o formulário do censo")
+async def preencher_censo(interaction: discord.Interaction):
+    """Abre o formulário para preencher o censo"""
+    try:
+        # Verificar se há censo ativo
+        censo = db.get_censo_ativo()
+        
+        if not censo:
+            await interaction.response.send_message(
+                "❌ Não há nenhum censo ativo no momento!",
+                ephemeral=True
+            )
+            return
+        
+        # Verificar se já passou da data limite
+        from datetime import datetime
+        sao_paulo_tz = timezone('America/Sao_Paulo')
+        agora = datetime.now(sao_paulo_tz)
+        data_limite = censo['data_limite']
+        
+        # Converter data_limite para datetime se necessário
+        if isinstance(data_limite, str):
+            try:
+                data_limite = datetime.fromisoformat(data_limite.replace('Z', '+00:00'))
+            except:
+                # Tentar parse manual se fromisoformat falhar
+                try:
+                    data_limite = datetime.strptime(data_limite, "%Y-%m-%d %H:%M:%S")
+                    data_limite = sao_paulo_tz.localize(data_limite)
+                except:
+                    pass
+        
+        # Se data_limite não tem timezone, assumir que está em UTC e converter
+        if hasattr(data_limite, 'tzinfo') and data_limite.tzinfo is None:
+            data_limite = sao_paulo_tz.localize(data_limite)
+        elif hasattr(data_limite, 'tzinfo') and data_limite.tzinfo is not None:
+            # Converter para timezone de São Paulo
+            data_limite = data_limite.astimezone(sao_paulo_tz)
+        
+        if agora > data_limite:
+            await interaction.response.send_message(
+                f"❌ O prazo para preencher o censo **{censo['nome']}** já expirou!\n"
+                f"Data limite: <t:{int(data_limite.timestamp())}:F>",
+                ephemeral=True
+            )
+            return
+        
+        # Verificar se o usuário tem o cargo "Registrado"
+        member = interaction.guild.get_member(interaction.user.id)
+        if not member:
+            await interaction.response.send_message(
+                "❌ Você precisa ser membro do servidor para preencher o censo!",
+                ephemeral=True
+            )
+            return
+        
+        registered_role = interaction.guild.get_role(REGISTERED_ROLE_ID) if REGISTERED_ROLE_ID else None
+        if registered_role and registered_role not in member.roles:
+            await interaction.response.send_message(
+                "❌ Você precisa ter o cargo **Registrado** para preencher o censo!\n"
+                "Use `/registro` para se registrar primeiro.",
+                ephemeral=True
+            )
+            return
+        
+        # Verificar se o censo tem estrutura fixa (campos específicos) ou campos personalizados
+        campos = censo.get('campos', [])
+        
+        # Se não houver campos definidos ou for estrutura fixa, usar View com dropdowns
+        if not campos or campos == []:
+            # Usar estrutura fixa com View
+            embed = discord.Embed(
+                title="📋 Preencher Censo",
+                description=f"**Censo:** {censo['nome']}\n\n"
+                           f"Preencha todos os campos abaixo usando os dropdowns e botões.\n\n"
+                           f"**Instruções:**\n"
+                           f"1. Clique em 'Selecionar Classe' e digite sua classe (autocomplete)\n"
+                           f"2. Selecione Awakening ou Succession\n"
+                           f"3. Selecione quantidade de Armaduras de Edania\n"
+                           f"4. Você tem Interesse em alguma função?\n"
+                           f"5. Clique em 'Preencher AP e Defesa'\n"
+                           f"6. Clique em 'Enviar Imagens' e cole os links do Imgur\n"
+                           f"7. Clique em 'Finalizar Censo'",
+                color=discord.Color.blue(),
+                timestamp=discord.utils.utcnow()
+            )
+            
+            # Instruções sobre como enviar imagens via Imgur
+            exemplos_texto = "**Você DEVE usar o Imgur para enviar as imagens!**\n\n"
+            exemplos_texto += "1. Acesse https://imgur.com/\n"
+            exemplos_texto += "2. Clique em 'New post' ou arraste a imagem\n"
+            exemplos_texto += "3. Faça upload da sua imagem\n"
+            exemplos_texto += "4. Copie o link (ex: https://imgur.com/abc123)\n"
+            exemplos_texto += "5. Cole o link no formulário quando clicar em 'Enviar Imagens'\n\n"
+            exemplos_texto += "⚠️ **Links do Discord NÃO são aceitos!** Use apenas Imgur."
+            
+            embed.add_field(
+                name="📷 Como enviar imagens (OBRIGATÓRIO - IMGUR):",
+                value=exemplos_texto,
+                inline=False
+            )
+            
+            # Adicionar exemplos de imagens se houver
+            exemplos = censo.get('exemplos', {})
+            embeds_para_enviar = [embed]  # Lista de embeds para enviar
+            
+            if exemplos:
+                # Adicionar seção destacada sobre os exemplos
+                exemplos_info = "**📸 EXEMPLOS DE PRINTS ABAIXO**\n\n"
+                exemplos_info += "Veja as imagens de exemplo abaixo para entender exatamente como devem ser suas prints:\n\n"
+                
+                if exemplos.get('gear') and exemplos.get('passiva'):
+                    exemplos_info += "⬇️ **Duas imagens de exemplo serão mostradas abaixo:**\n"
+                    exemplos_info += "• **Print da Gear** - Mostra como deve ser a print da sua gear com cristais e artefato\n"
+                    exemplos_info += "• **Print da Passiva do Node** - Mostra como deve ser a print das suas passivas de node\n\n"
+                    exemplos_info += "💡 **Dica:** Use essas imagens como referência para fazer suas próprias prints!"
+                elif exemplos.get('gear'):
+                    exemplos_info += "⬇️ **Exemplo de Print da Gear abaixo**\n"
+                    exemplos_info += "Mostra como deve ser a print da sua gear com cristais e artefato"
+                elif exemplos.get('passiva'):
+                    exemplos_info += "⬇️ **Exemplo de Print da Passiva do Node abaixo**\n"
+                    exemplos_info += "Mostra como deve ser a print das suas passivas de node"
+                
+                embed.add_field(
+                    name="",
+                    value=exemplos_info,
+                    inline=False
+                )
+                
+                # Criar embeds separados para as imagens (para aparecerem lado a lado)
+                if exemplos.get('gear') and exemplos.get('passiva'):
+                    # Duas imagens: criar dois embeds com descrições detalhadas
+                    embed_gear = discord.Embed(
+                        title="📷 EXEMPLO - Print da Gear",
+                        description="**Esta é a print que você deve enviar da sua Gear:**\n\n"
+                                   "✅ Deve mostrar toda a sua gear equipada\n"
+                                   "✅ Deve mostrar todos os cristais instalados\n"
+                                   "✅ Deve mostrar o artefato equipado\n"
+                                   "✅ Deve estar nítida e legível\n\n"
+                                   "**Use esta imagem como referência para fazer sua print!**",
+                        color=discord.Color.green(),
+                        url=exemplos['gear']
+                    )
+                    embed_gear.set_image(url=exemplos['gear'])
+                    embed_gear.set_footer(text="Clique no título para abrir a imagem em tamanho maior")
+                    
+                    embed_passiva = discord.Embed(
+                        title="📷 EXEMPLO - Print da Passiva do Node",
+                        description="**Esta é a print que você deve enviar das suas Passivas de Node:**\n\n"
+                                   "✅ Deve mostrar todas as passivas de node ativadas\n"
+                                   "✅ Deve estar nítida e legível\n"
+                                   "✅ Deve mostrar a árvore completa de passivas\n\n"
+                                   "**Use esta imagem como referência para fazer sua print!**",
+                        color=discord.Color.green(),
+                        url=exemplos['passiva']
+                    )
+                    embed_passiva.set_image(url=exemplos['passiva'])
+                    embed_passiva.set_footer(text="Clique no título para abrir a imagem em tamanho maior")
+                    
+                    embeds_para_enviar = [embed, embed_gear, embed_passiva]
+                elif exemplos.get('gear'):
+                    # Apenas gear - adicionar descrição no embed principal
+                    embed.add_field(
+                        name="📷 Exemplo - Print da Gear",
+                        value="**Veja a imagem abaixo como referência:**\n"
+                              "✅ Deve mostrar toda a sua gear equipada\n"
+                              "✅ Deve mostrar todos os cristais instalados\n"
+                              "✅ Deve mostrar o artefato equipado\n"
+                              "✅ Deve estar nítida e legível",
+                        inline=False
+                    )
+                    embed.set_image(url=exemplos['gear'])
+                elif exemplos.get('passiva'):
+                    # Apenas passiva - adicionar descrição no embed principal
+                    embed.add_field(
+                        name="📷 Exemplo - Print da Passiva do Node",
+                        value="**Veja a imagem abaixo como referência:**\n"
+                              "✅ Deve mostrar todas as passivas de node ativadas\n"
+                              "✅ Deve estar nítida e legível\n"
+                              "✅ Deve mostrar a árvore completa de passivas",
+                        inline=False
+                    )
+                    embed.set_image(url=exemplos['passiva'])
+            
+            embed.set_footer(text="O formulário expira em 30 minutos")
+            
+            view = CensoView(censo['id'])
+            # Preencher nome do Discord automaticamente
+            view.dados['nome_discord'] = interaction.user.display_name
+            
+            # Enviar todos os embeds (o primeiro com a view)
+            if len(embeds_para_enviar) == 1:
+                message = await interaction.response.send_message(embed=embeds_para_enviar[0], view=view, ephemeral=True)
+                view.original_message = await interaction.original_response()
+            else:
+                # Enviar primeiro embed com view
+                await interaction.response.send_message(embed=embeds_para_enviar[0], view=view, ephemeral=True)
+                view.original_message = await interaction.original_response()
+                # Enviar os outros embeds como followup
+                for embed_extra in embeds_para_enviar[1:]:
+                    await interaction.followup.send(embed=embed_extra, ephemeral=True)
+        else:
+            # Usar modal dinâmico (compatibilidade com censos antigos)
+            modal = CensoModal(censo['id'], campos)
+            await interaction.response.send_modal(modal)
+        
+    except Exception as e:
+        logger.error(f"Erro ao abrir formulário de censo: {e}")
+        if interaction.response.is_done():
+            await interaction.followup.send(
+                f"❌ Erro ao abrir formulário: {str(e)}",
+                ephemeral=True
+            )
+        else:
+            await interaction.response.send_message(
+                f"❌ Erro ao abrir formulário: {str(e)}",
+                ephemeral=True
+            )
+
+@bot.tree.command(name="censo_status", description="[ADMIN] Verifica status do censo (quem preencheu e quem não preencheu)")
+@app_commands.default_permissions(administrator=True)
+async def censo_status(interaction: discord.Interaction):
+    """Mostra quem preencheu e quem não preencheu o censo"""
+    if not is_admin_user(interaction.user):
+        await interaction.response.send_message(
+            "❌ Apenas administradores podem usar este comando!",
+            ephemeral=True
+        )
+        return
+    
+    try:
+        await interaction.response.defer(ephemeral=True)
+        
+        # Buscar censo ativo
+        censo = db.get_censo_ativo()
+        
+        if not censo:
+            await interaction.followup.send(
+                "❌ Não há nenhum censo ativo no momento!",
+                ephemeral=True
+            )
+            return
+        
+        # Buscar quem preencheu
+        players_com_censo = db.get_players_com_censo(censo['id'])
+        user_ids_com_censo = {p['user_id'] for p in players_com_censo}
+        
+        # Buscar todos os membros registrados
+        valid_user_ids = await get_guild_member_ids(interaction.guild)
+        members_with_registry = set()
+        
+        if valid_user_ids:
+            all_registered = db.get_all_gearscores(valid_user_ids=valid_user_ids)
+            for record in all_registered:
+                if isinstance(record, dict):
+                    user_id = record.get('user_id', '')
+                else:
+                    user_id = record[1] if len(record) > 1 else ''
+                if user_id:
+                    members_with_registry.add(str(user_id))
+        
+        # Separar quem preencheu e quem não preencheu
+        preencheram = []
+        nao_preencheram = []
+        
+        for user_id in members_with_registry:
+            member = interaction.guild.get_member(int(user_id))
+            if member:
+                if user_id in user_ids_com_censo:
+                    preencheram.append(member)
+                else:
+                    nao_preencheram.append(member)
+        
+        # Converter data_limite para timestamp
+        data_limite_ts = censo['data_limite']
+        if isinstance(data_limite_ts, str):
+            try:
+                data_limite_ts = datetime.fromisoformat(data_limite_ts.replace('Z', '+00:00'))
+            except:
+                try:
+                    data_limite_ts = datetime.strptime(data_limite_ts, "%Y-%m-%d %H:%M:%S")
+                    sao_paulo_tz = timezone('America/Sao_Paulo')
+                    data_limite_ts = sao_paulo_tz.localize(data_limite_ts)
+                except:
+                    pass
+        
+        if hasattr(data_limite_ts, 'timestamp'):
+            timestamp = int(data_limite_ts.timestamp())
+        else:
+            timestamp = int(datetime.now().timestamp())
+        
+        # Criar embed
+        embed = discord.Embed(
+            title=f"📊 Status do Censo: {censo['nome']}",
+            description=f"Data limite: <t:{timestamp}:F>",
+            color=discord.Color.blue(),
+            timestamp=discord.utils.utcnow()
+        )
+        
+        # Lista de quem preencheu
+        if preencheram:
+            preencheram.sort(key=lambda m: m.display_name.lower())
+            preencheram_list = "\n".join([f"✅ {m.mention} ({m.display_name})" for m in preencheram[:50]])
+            if len(preencheram) > 50:
+                preencheram_list += f"\n\n... e mais {len(preencheram) - 50} membro(s)"
+            embed.add_field(
+                name=f"✅ Preencheram ({len(preencheram)})",
+                value=preencheram_list,
+                inline=False
+            )
+        else:
+            embed.add_field(
+                name="✅ Preencheram (0)",
+                value="Ninguém preencheu ainda.",
+                inline=False
+            )
+        
+        # Lista de quem não preencheu
+        if nao_preencheram:
+            nao_preencheram.sort(key=lambda m: m.display_name.lower())
+            nao_preencheram_list = "\n".join([f"❌ {m.mention} ({m.display_name})" for m in nao_preencheram[:50]])
+            if len(nao_preencheram) > 50:
+                nao_preencheram_list += f"\n\n... e mais {len(nao_preencheram) - 50} membro(s)"
+            embed.add_field(
+                name=f"❌ Não Preencheram ({len(nao_preencheram)})",
+                value=nao_preencheram_list,
+                inline=False
+            )
+        else:
+            embed.add_field(
+                name="❌ Não Preencheram (0)",
+                value="Todos preencheram! 🎉",
+                inline=False
+            )
+        
+        embed.add_field(
+            name="📈 Estatísticas",
+            value=f"**Total de membros registrados:** {len(members_with_registry)}\n"
+                  f"**Preencheram:** {len(preencheram)} ({len(preencheram)/len(members_with_registry)*100:.1f}%)\n"
+                  f"**Não preencheram:** {len(nao_preencheram)} ({len(nao_preencheram)/len(members_with_registry)*100:.1f}%)",
+            inline=False
+        )
+        
+        embed.set_footer(text=f"Consulta executada por {interaction.user.display_name}")
+        await interaction.followup.send(embed=embed, ephemeral=True)
+        
+    except Exception as e:
+        logger.error(f"Erro ao verificar status do censo: {e}")
+        import traceback
+        error_details = traceback.format_exc()
+        logger.error(f"Traceback: {error_details}")
+        await interaction.followup.send(
+            f"❌ Erro ao verificar status: {str(e)}",
+            ephemeral=True
+        )
+
+@bot.tree.command(name="censo_reenviar_sheets", description="[ADMIN] Reenvia todos os dados do censo para o Google Sheets")
+@app_commands.default_permissions(administrator=True)
+async def censo_reenviar_sheets(interaction: discord.Interaction):
+    """Reenvia todas as respostas do censo ativo para o Google Sheets"""
+    if not is_admin_user(interaction.user):
+        await interaction.response.send_message(
+            "❌ Apenas administradores podem usar este comando!",
+            ephemeral=True
+        )
+        return
+    
+    if not GOOGLE_SHEETS_ENABLED or not GOOGLE_SHEETS_AVAILABLE:
+        await interaction.response.send_message(
+            "❌ Google Sheets não está habilitado ou não está disponível!",
+            ephemeral=True
+        )
+        return
+    
+    try:
+        await interaction.response.defer(ephemeral=True)
+        
+        # Buscar censo ativo
+        censo = db.get_censo_ativo()
+        
+        if not censo:
+            await interaction.followup.send(
+                "❌ Não há nenhum censo ativo no momento!",
+                ephemeral=True
+            )
+            return
+        
+        # Buscar todas as respostas do censo
+        respostas = db.get_todas_respostas_censo(censo['id'])
+        
+        if not respostas:
+            await interaction.followup.send(
+                "❌ Nenhuma resposta encontrada para este censo!",
+                ephemeral=True
+            )
+            return
+        
+        # Preparar campos
+        campos_censo = censo.get('campos', [])
+        if not campos_censo:
+            campos_censo = [
+                'Classe', 'Awk/Succ', 'AP MAIN', 
+                'AP AWK', 'Defesa', 'Edania', 'Funções', 
+                'Gear Image', 'Passiva Node Image'
+            ]
+        
+        # Reenviar cada resposta
+        sucessos = 0
+        erros = 0
+        erros_detalhes = []
+        
+        for resposta in respostas:
+            try:
+                user_id = resposta['user_id']
+                dados = resposta['dados']
+                preenchido_em = resposta['preenchido_em']
+                family_name = resposta.get('family_name', '')
+                
+                # Buscar nome do usuário no Discord
+                try:
+                    member = interaction.guild.get_member(int(user_id))
+                    user_display_name = member.display_name if member else resposta.get('family_name', f'User {user_id}')
+                except:
+                    user_display_name = resposta.get('family_name', f'User {user_id}')
+                
+                # Adicionar family_name aos dados se não estiver
+                dados_com_family = dados.copy()
+                if not dados_com_family.get('family_name'):
+                    dados_com_family['family_name'] = family_name
+                
+                # Converter preenchido_em para datetime se necessário
+                if isinstance(preenchido_em, str):
+                    from datetime import datetime
+                    sao_paulo_tz = timezone('America/Sao_Paulo')
+                    try:
+                        timestamp = datetime.fromisoformat(preenchido_em.replace('Z', '+00:00'))
+                        if timestamp.tzinfo is None:
+                            timestamp = sao_paulo_tz.localize(timestamp)
+                    except:
+                        timestamp = datetime.now(timezone('America/Sao_Paulo'))
+                else:
+                    timestamp = preenchido_em
+                
+                # Enviar para Google Sheets
+                resultado = await enviar_para_google_sheets(
+                    dados_com_family,
+                    user_display_name,
+                    timestamp,
+                    campos_censo
+                )
+                
+                if resultado:
+                    sucessos += 1
+                    logger.info(f"Reenviado para Google Sheets: {user_display_name} (ID: {user_id})")
+                else:
+                    erros += 1
+                    erros_detalhes.append(f"{user_display_name} (ID: {user_id})")
+                    
+            except Exception as e:
+                erros += 1
+                erros_detalhes.append(f"{user_display_name if 'user_display_name' in locals() else 'Desconhecido'}: {str(e)}")
+                logger.error(f"Erro ao reenviar resposta de {user_id}: {e}")
+        
+        # Criar embed de resultado
+        embed = discord.Embed(
+            title="📊 Reenvio para Google Sheets",
+            description=f"**Censo:** {censo['nome']}\n\n"
+                       f"✅ **Sucessos:** {sucessos}\n"
+                       f"❌ **Erros:** {erros}\n"
+                       f"📝 **Total:** {len(respostas)}",
+            color=discord.Color.green() if erros == 0 else discord.Color.orange(),
+            timestamp=discord.utils.utcnow()
+        )
+        
+        if erros > 0 and erros_detalhes:
+            # Limitar detalhes de erros (máximo 10)
+            erros_texto = "\n".join(erros_detalhes[:10])
+            if len(erros_detalhes) > 10:
+                erros_texto += f"\n... e mais {len(erros_detalhes) - 10} erro(s)"
+            embed.add_field(
+                name="❌ Erros",
+                value=erros_texto[:1024],
+                inline=False
+            )
+        
+        embed.set_footer(text=f"Reenviado por {interaction.user.display_name}")
+        
+        await interaction.followup.send(embed=embed, ephemeral=True)
+        logger.info(f"Reenvio de censo concluído: {sucessos} sucessos, {erros} erros")
+        
+    except Exception as e:
+        logger.error(f"Erro ao reenviar censo para Google Sheets: {e}")
+        import traceback
+        logger.error(traceback.format_exc())
+        await interaction.followup.send(
+            f"❌ Erro ao reenviar censo: {str(e)}",
+            ephemeral=True
+        )
+
+@bot.tree.command(name="censo_finalizar", description="[ADMIN] Finaliza o censo e aplica tags finais")
+@app_commands.default_permissions(administrator=True)
+async def censo_finalizar(interaction: discord.Interaction):
+    """Finaliza o censo e aplica tags finais (Censo Completo / Sem Censo)"""
+    if not is_admin_user(interaction.user):
+        await interaction.response.send_message(
+            "❌ Apenas administradores podem usar este comando!",
+            ephemeral=True
+        )
+        return
+    
+    try:
+        await interaction.response.defer(ephemeral=True)
+        
+        # Buscar censo ativo
+        censo = db.get_censo_ativo()
+        
+        if not censo:
+            await interaction.followup.send(
+                "❌ Não há nenhum censo ativo para finalizar!",
+                ephemeral=True
+            )
+            return
+        
+        # Buscar quem preencheu
+        players_com_censo = db.get_players_com_censo(censo['id'])
+        user_ids_com_censo = {p['user_id'] for p in players_com_censo}
+        
+        # Buscar todos os membros registrados
+        valid_user_ids = await get_guild_member_ids(interaction.guild)
+        members_with_registry = set()
+        
+        if valid_user_ids:
+            all_registered = db.get_all_gearscores(valid_user_ids=valid_user_ids)
+            for record in all_registered:
+                if isinstance(record, dict):
+                    user_id = record.get('user_id', '')
+                else:
+                    user_id = record[1] if len(record) > 1 else ''
+                if user_id:
+                    members_with_registry.add(str(user_id))
+        
+        # Aplicar tags
+        censo_completo_role = interaction.guild.get_role(CENSO_COMPLETO_ROLE_ID) if CENSO_COMPLETO_ROLE_ID else None
+        sem_censo_role = interaction.guild.get_role(SEM_CENSO_ROLE_ID) if SEM_CENSO_ROLE_ID else None
+        
+        aplicados_completo = 0
+        aplicados_sem = 0
+        erros = 0
+        
+        for user_id in members_with_registry:
+            member = interaction.guild.get_member(int(user_id))
+            if not member:
+                continue
+            
+            try:
+                if user_id in user_ids_com_censo:
+                    # Preencheu: adicionar "Censo Completo", remover "Sem Censo"
+                    if censo_completo_role and censo_completo_role not in member.roles:
+                        await member.add_roles(censo_completo_role, reason=f"Censo finalizado: {censo['nome']}")
+                        aplicados_completo += 1
+                    if sem_censo_role and sem_censo_role in member.roles:
+                        await member.remove_roles(sem_censo_role, reason=f"Censo finalizado: {censo['nome']}")
+                else:
+                    # Não preencheu: adicionar "Sem Censo", remover "Censo Completo"
+                    if sem_censo_role and sem_censo_role not in member.roles:
+                        await member.add_roles(sem_censo_role, reason=f"Censo finalizado: {censo['nome']}")
+                        aplicados_sem += 1
+                    if censo_completo_role and censo_completo_role in member.roles:
+                        await member.remove_roles(censo_completo_role, reason=f"Censo finalizado: {censo['nome']}")
+            except Exception as e:
+                logger.error(f"Erro ao aplicar tag para {member.display_name}: {e}")
+                erros += 1
+        
+        # Finalizar censo no banco
+        db.finalizar_censo(censo['id'])
+        
+        embed = discord.Embed(
+            title="✅ Censo Finalizado!",
+            description=f"O censo **{censo['nome']}** foi finalizado e as tags foram aplicadas.",
+            color=discord.Color.green(),
+            timestamp=discord.utils.utcnow()
+        )
+        embed.add_field(
+            name="✅ Censo Completo",
+            value=f"**{aplicados_completo}** membros receberam a tag",
+            inline=True
+        )
+        embed.add_field(
+            name="❌ Sem Censo",
+            value=f"**{aplicados_sem}** membros receberam a tag",
+            inline=True
+        )
+        if erros > 0:
+            embed.add_field(
+                name="⚠️ Erros",
+                value=f"{erros} tags não puderam ser aplicadas",
+                inline=False
+            )
+        embed.set_footer(text=f"Finalizado por {interaction.user.display_name}")
+        
+        await interaction.followup.send(embed=embed, ephemeral=True)
+        logger.info(f"Censo '{censo['nome']}' finalizado por {interaction.user.display_name}")
+        
+    except Exception as e:
+        logger.error(f"Erro ao finalizar censo: {e}")
+        import traceback
+        error_details = traceback.format_exc()
+        logger.error(f"Traceback: {error_details}")
+        await interaction.followup.send(
+            f"❌ Erro ao finalizar censo: {str(e)}",
+            ephemeral=True
+        )
 
 if __name__ == "__main__":
     if not DISCORD_TOKEN:

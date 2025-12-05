@@ -30,3 +30,30 @@ DISCORD_TOKEN=seu_token_do_bot_aqui
 # Para obter o ID de um cargo: Ative o Modo Desenvolvedor no Discord e clique com botão direito no cargo > Copiar ID
 # ALLOWED_DM_ROLES=123456789012345678,987654321098765432
 
+# ============================================
+# CONFIGURAÇÃO DE CENSO
+# ============================================
+# IDs dos cargos de censo (separados por vírgula)
+# CENSO_COMPLETO_ROLE_ID=123456789012345678
+# SEM_CENSO_ROLE_ID=987654321098765432
+# Para obter o ID de um cargo: Ative o Modo Desenvolvedor no Discord e clique com botão direito no cargo > Copiar ID
+
+# ============================================
+# CONFIGURAÇÃO DO GOOGLE SHEETS (OPCIONAL)
+# ============================================
+# Para habilitar envio automático para Google Sheets quando alguém preencher o censo
+# 
+# Passos para configurar:
+# 1. Acesse https://console.cloud.google.com/
+# 2. Crie um projeto (ou use existente)
+# 3. Ative a Google Sheets API
+# 4. Crie uma Service Account (IAM & Admin > Service Accounts)
+# 5. Baixe o JSON da chave e salve como credentials.json na raiz do projeto
+# 6. Compartilhe a planilha com o e-mail da Service Account
+# 7. Obtenha o ID da planilha na URL: https://docs.google.com/spreadsheets/d/ID_AQUI/edit
+#
+# GOOGLE_SHEETS_ENABLED=true
+# GOOGLE_SHEETS_SPREADSHEET_ID=ID_DA_PLANILHA_AQUI
+# GOOGLE_SHEETS_WORKSHEET_NAME=Censo
+# GOOGLE_SHEETS_CREDENTIALS_PATH=credentials.json
+

@@ -51,9 +51,24 @@ REGISTERED_ROLE_ID = 1442888990997876817
 # ID do cargo "Não Registrado" - dado a membros da guilda que ainda não fizeram registro
 UNREGISTERED_ROLE_ID = 1442889439717359728
 
+# IDs dos cargos de censo
+# ID do cargo "Censo Completo" - dado quando o player preenche o censo
+CENSO_COMPLETO_ROLE_ID = os.getenv('CENSO_COMPLETO_ROLE_ID')
+CENSO_COMPLETO_ROLE_ID = int(CENSO_COMPLETO_ROLE_ID) if CENSO_COMPLETO_ROLE_ID else None
+
+# ID do cargo "Sem Censo" - dado quando o player não preencheu o censo até a data limite
+SEM_CENSO_ROLE_ID = os.getenv('SEM_CENSO_ROLE_ID')
+SEM_CENSO_ROLE_ID = int(SEM_CENSO_ROLE_ID) if SEM_CENSO_ROLE_ID else None
+
 # Configurações de lembrete automático de atualização de GS
 GS_UPDATE_REMINDER_DAYS = 10  # Dias sem atualizar para enviar lembrete
 GS_REMINDER_CHECK_HOUR = 12  # Hora do dia para verificar (12 = meio-dia)
+
+# Configurações do Google Sheets para Censo (opcional)
+GOOGLE_SHEETS_ENABLED = os.getenv('GOOGLE_SHEETS_ENABLED', 'false').lower() == 'true'
+GOOGLE_SHEETS_SPREADSHEET_ID = os.getenv('GOOGLE_SHEETS_SPREADSHEET_ID')
+GOOGLE_SHEETS_WORKSHEET_NAME = os.getenv('GOOGLE_SHEETS_WORKSHEET_NAME', 'Censo')
+GOOGLE_SHEETS_CREDENTIALS_PATH = os.getenv('GOOGLE_SHEETS_CREDENTIALS_PATH', 'credentials.json')
 
 
 # Lista de classes do Black Desert Online (ordem alfabética)

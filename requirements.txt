@@ -9,3 +9,7 @@ psycopg2-binary>=2.9.9
 # Para MongoDB Atlas:
 pymongo>=4.6.0
 
+# Para Google Sheets (opcional - para integração com censo):
+gspread>=5.12.0
+google-auth>=2.23.4
+
