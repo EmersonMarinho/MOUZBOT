@@ -31,6 +31,23 @@ DISCORD_TOKEN=seu_token_do_bot_aqui
 # ALLOWED_DM_ROLES=123456789012345678,987654321098765432
 
 # ============================================
+# CONFIGURAÇÃO DE ADMINISTRADORES
+# ============================================
+# IDs de usuários que podem usar comandos de ADMIN (além dos administradores do servidor)
+# Separe múltiplos IDs por vírgula (sem espaços)
+# Exemplo: ADMIN_USER_IDS=1254473982711828584,987654321098765432
+# Deixe vazio ou não configure para permitir apenas administradores do servidor
+# Para obter o ID de um usuário: Ative o Modo Desenvolvedor no Discord e clique com botão direito no usuário > Copiar ID
+# ADMIN_USER_IDS=1254473982711828584
+
+# IDs dos cargos que podem usar comandos de ADMIN (além dos administradores do servidor)
+# Separe múltiplos IDs por vírgula (sem espaços)
+# Exemplo: ADMIN_ROLE_IDS=123456789012345678,987654321098765432
+# Deixe vazio ou não configure para permitir apenas administradores do servidor
+# Para obter o ID de um cargo: Ative o Modo Desenvolvedor no Discord e clique com botão direito no cargo > Copiar ID
+# ADMIN_ROLE_IDS=123456789012345678
+
+# ============================================
 # CONFIGURAÇÃO DE CENSO
 # ============================================
 # IDs dos cargos de censo (separados por vírgula)

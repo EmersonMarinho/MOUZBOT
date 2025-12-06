@@ -30,6 +30,12 @@ ALLOWED_DM_ROLES = [role_id.strip() for role_id in ALLOWED_DM_ROLES if role_id.s
 ADMIN_USER_IDS = os.getenv('ADMIN_USER_IDS', '').split(',') if os.getenv('ADMIN_USER_IDS') else []
 ADMIN_USER_IDS = [user_id.strip() for user_id in ADMIN_USER_IDS if user_id.strip()]
 
+# IDs dos cargos que podem usar comandos de ADMIN (além dos administradores do servidor)
+# Exemplo: ADMIN_ROLE_IDS=123456789,987654321
+# Deixe vazio para permitir apenas administradores do servidor
+ADMIN_ROLE_IDS = os.getenv('ADMIN_ROLE_IDS', '').split(',') if os.getenv('ADMIN_ROLE_IDS') else []
+ADMIN_ROLE_IDS = [role_id.strip() for role_id in ADMIN_ROLE_IDS if role_id.strip()]
+
 # ID do canal para notificações de registro/atualização
 NOTIFICATION_CHANNEL_ID = 1442347196103004242
 

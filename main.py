@@ -6,7 +6,7 @@ import io
 import logging
 from datetime import datetime
 from pytz import timezone
-from config import DISCORD_TOKEN, BDO_CLASSES, DATABASE_NAME, DATABASE_URL, ALLOWED_DM_ROLES, NOTIFICATION_CHANNEL_ID, GUILD_MEMBER_ROLE_ID, DM_REPORT_CHANNEL_ID, LIST_CHANNEL_ID, MOVE_LOG_CHANNEL_ID, REGISTERED_ROLE_ID, UNREGISTERED_ROLE_ID, GS_UPDATE_REMINDER_DAYS, GS_REMINDER_CHECK_HOUR, ADMIN_USER_IDS, CENSO_COMPLETO_ROLE_ID, SEM_CENSO_ROLE_ID, GOOGLE_SHEETS_ENABLED, GOOGLE_SHEETS_SPREADSHEET_ID, GOOGLE_SHEETS_WORKSHEET_NAME, GOOGLE_SHEETS_CREDENTIALS_PATH
+from config import DISCORD_TOKEN, BDO_CLASSES, DATABASE_NAME, DATABASE_URL, ALLOWED_DM_ROLES, NOTIFICATION_CHANNEL_ID, GUILD_MEMBER_ROLE_ID, DM_REPORT_CHANNEL_ID, LIST_CHANNEL_ID, MOVE_LOG_CHANNEL_ID, REGISTERED_ROLE_ID, UNREGISTERED_ROLE_ID, GS_UPDATE_REMINDER_DAYS, GS_REMINDER_CHECK_HOUR, ADMIN_USER_IDS, ADMIN_ROLE_IDS, CENSO_COMPLETO_ROLE_ID, SEM_CENSO_ROLE_ID, GOOGLE_SHEETS_ENABLED, GOOGLE_SHEETS_SPREADSHEET_ID, GOOGLE_SHEETS_WORKSHEET_NAME, GOOGLE_SHEETS_CREDENTIALS_PATH
 from datetime import timedelta
 # Importar o banco de dados apropriado
 if DATABASE_URL:
@@ -23,23 +23,62 @@ bot = commands.Bot(command_prefix='!', intents=intents)
 
 
 # Função helper para verificar se usuário tem permissão de admin
-def is_admin_user(user: discord.Member) -> bool:
+def is_admin_user(user) -> bool:
     """
     Verifica se o usuário pode usar comandos de admin.
     Retorna True se:
     - O usuário é administrador do servidor OU
-    - O ID do usuário está na lista ADMIN_USER_IDS
+    - O ID do usuário está na lista ADMIN_USER_IDS OU
+    - O usuário possui algum cargo da lista ADMIN_ROLE_IDS
+    
+    Aceita tanto discord.Member quanto discord.User (tenta obter Member do guild se necessário)
     """
+    # Se não for Member, tentar obter do guild
+    if not isinstance(user, discord.Member):
+        # Se não houver guild, não pode verificar permissões
+        if not hasattr(user, 'guild') or not user.guild:
+            user_id_str = str(user.id)
+            # Verificar apenas por ID de usuário
+            if ADMIN_USER_IDS and user_id_str in ADMIN_USER_IDS:
+                logger.info(f"[ADMIN] ✅ Usuário {user.display_name} (ID: {user_id_str}) autorizado via ADMIN_USER_IDS (sem guild)")
+                return True
+            logger.info(f"[ADMIN] ❌ Usuário {user.display_name} (ID: {user_id_str}) NÃO autorizado (sem guild)")
+            return False
+    
+    user_id_str = str(user.id)
+    display_name = getattr(user, 'display_name', getattr(user, 'name', 'Unknown'))
+    
+    # Log detalhado para debug
+    logger.info(f"[ADMIN] Verificando acesso para {display_name} (ID: {user_id_str})")
+    
     # Verificar se é administrador do servidor
-    if user.guild_permissions.administrator:
+    if hasattr(user, 'guild_permissions') and user.guild_permissions.administrator:
+        logger.info(f"[ADMIN] ✅ Usuário {display_name} (ID: {user_id_str}) autorizado como administrador do servidor")
         return True
     
     # Verificar se está na lista de usuários admin
-    user_id_str = str(user.id)
     if ADMIN_USER_IDS and user_id_str in ADMIN_USER_IDS:
-        logger.info(f"[ADMIN] Usuário {user.display_name} (ID: {user_id_str}) autorizado via ADMIN_USER_IDS")
+        logger.info(f"[ADMIN] ✅ Usuário {display_name} (ID: {user_id_str}) autorizado via ADMIN_USER_IDS")
         return True
     
+    # Verificar se possui algum cargo admin
+    if ADMIN_ROLE_IDS and hasattr(user, 'roles'):
+        member_role_ids = [str(role.id) for role in user.roles]
+        logger.info(f"[ADMIN] Cargos do usuário {display_name}: {member_role_ids}")
+        logger.info(f"[ADMIN] ADMIN_ROLE_IDS configurado: {ADMIN_ROLE_IDS}")
+        
+        matching_roles = [role for role in user.roles if str(role.id) in ADMIN_ROLE_IDS]
+        if matching_roles:
+            logger.info(f"[ADMIN] ✅ Usuário {display_name} (ID: {user_id_str}) autorizado via ADMIN_ROLE_IDS. Cargos correspondentes: {[role.name for role in matching_roles]}")
+            return True
+        else:
+            logger.info(f"[ADMIN] ❌ Usuário {display_name} (ID: {user_id_str}) NÃO possui nenhum cargo da lista ADMIN_ROLE_IDS")
+    elif ADMIN_ROLE_IDS:
+        logger.info(f"[ADMIN] ADMIN_ROLE_IDS configurado mas usuário não tem atributo 'roles'")
+    else:
+        logger.info(f"[ADMIN] ADMIN_ROLE_IDS não configurado ou vazio")
+    
+    logger.info(f"[ADMIN] ❌ Usuário {display_name} (ID: {user_id_str}) NÃO autorizado")
     return False
 
 # Função helper para verificar se usuário tem permissão para usar comandos de DM em massa
@@ -772,6 +811,20 @@ async def on_ready():
     except Exception as e:
         logger.error(f'Erro ao sincronizar comandos: {e}')
     
+    # Log de configuração de administradores
+    if ADMIN_USER_IDS:
+        logger.info(f'[ADMIN] ADMIN_USER_IDS carregado: {ADMIN_USER_IDS}')
+    else:
+        logger.info(f'[ADMIN] ADMIN_USER_IDS não configurado ou vazio.')
+    
+    if ADMIN_ROLE_IDS:
+        logger.info(f'[ADMIN] ADMIN_ROLE_IDS carregado: {ADMIN_ROLE_IDS}')
+    else:
+        logger.info(f'[ADMIN] ADMIN_ROLE_IDS não configurado ou vazio.')
+    
+    if not ADMIN_USER_IDS and not ADMIN_ROLE_IDS:
+        logger.info(f'[ADMIN] Apenas administradores do servidor terão acesso aos comandos de ADMIN.')
+    
     # Sincronizar cargos de registro de todos os membros da guilda
     for guild in bot.guilds:
         try:
@@ -1095,7 +1148,6 @@ async def registro(
     linkgear="Link do gear (obrigatório)"
 )
 @app_commands.autocomplete(classe_pvp=classe_autocomplete)
-@app_commands.default_permissions(administrator=True)
 async def registro_manual(
     interaction: discord.Interaction,
     usuario: discord.Member,
@@ -1847,7 +1899,6 @@ async def perfil(interaction: discord.Interaction):
 
 @bot.tree.command(name="pre", description="[ADMIN] Visualiza o perfil de outro membro")
 @app_commands.describe(usuario="Usuário para visualizar o perfil")
-@app_commands.default_permissions(administrator=True)
 async def pre(interaction: discord.Interaction, usuario: discord.Member):
     """Visualiza o perfil de outro membro (apenas administradores)"""
     if not is_admin_user(interaction.user):
@@ -2494,7 +2545,6 @@ class ClassStatsView(discord.ui.View):
 
 
 @bot.tree.command(name="estatisticas_classes", description="[ADMIN] Mostra estatísticas das classes na guilda")
-@app_commands.default_permissions(administrator=True)
 async def estatisticas_classes(interaction: discord.Interaction):
     """Mostra estatísticas das classes na guilda (apenas administradores)"""
     if not is_admin_user(interaction.user):
@@ -2663,7 +2713,6 @@ async def estatisticas_classes(interaction: discord.Interaction):
             )
 
 @bot.tree.command(name="stats", description="[ADMIN] Mostra estatísticas completas de todos os membros")
-@app_commands.default_permissions(administrator=True)
 async def stats(interaction: discord.Interaction):
     """Mostra lista completa de todos os membros com gearscore (apenas administradores)"""
     if not is_admin_user(interaction.user):
@@ -2910,7 +2959,6 @@ async def stats(interaction: discord.Interaction):
             )
 
 @bot.tree.command(name="ranking_gearscore", description="[ADMIN] Mostra o ranking de gearscore")
-@app_commands.default_permissions(administrator=True)
 async def ranking_gearscore(interaction: discord.Interaction):
     """Mostra o ranking de gearscore (apenas administradores)"""
     if not is_admin_user(interaction.user):
@@ -3007,7 +3055,6 @@ async def ranking_gearscore(interaction: discord.Interaction):
     classe="Classe a ser visualizada (digite para buscar)"
 )
 @app_commands.autocomplete(classe=classe_autocomplete)
-@app_commands.default_permissions(administrator=True)
 async def membros_classe(interaction: discord.Interaction, classe: str):
     """Visualiza todos os membros registrados de uma classe com todas as informações (apenas administradores)"""
     if not is_admin_user(interaction.user):
@@ -3156,7 +3203,6 @@ async def membros_classe(interaction: discord.Interaction, classe: str):
     usuario="Usuário que receberá a mensagem",
     mensagem="Mensagem a ser enviada"
 )
-@app_commands.default_permissions(administrator=True)
 async def enviar_dm(interaction: discord.Interaction, usuario: discord.Member, mensagem: str):
     """Envia uma DM para um usuário (apenas administradores)"""
     try:
@@ -3517,7 +3563,6 @@ async def lista(interaction: discord.Interaction, sala: str, nome_lista: str, ti
             )
 
 @bot.tree.command(name="relatorio_lista", description="[ADMIN] Mostra relatório de participação em eventos do mês")
-@app_commands.default_permissions(administrator=True)
 async def relatorio_lista(interaction: discord.Interaction):
     """Mostra relatório de participação em eventos (GvG, Treino, etc) do mês atual"""
     if not is_admin_user(interaction.user):
@@ -3662,7 +3707,6 @@ async def relatorio_lista(interaction: discord.Interaction):
 )
 @app_commands.autocomplete(sala_origem=voice_channel_autocomplete)
 @app_commands.autocomplete(sala_destino=voice_channel_autocomplete)
-@app_commands.default_permissions(administrator=True)
 async def mover_sala(interaction: discord.Interaction, sala_origem: str, sala_destino: str):
     """Move todos os membros de uma sala de voz para outra (apenas administradores)"""
     if not is_admin_user(interaction.user):
@@ -4197,7 +4241,6 @@ async def dm_cargo(interaction: discord.Interaction, cargos: str, mensagem: str,
     classe="Classe a ser listada (digite para buscar)"
 )
 @app_commands.autocomplete(classe=classe_autocomplete)
-@app_commands.default_permissions(administrator=True)
 async def admin_lista_classe(interaction: discord.Interaction, classe: str):
     """Lista todos os membros de uma classe específica (apenas administradores)"""
     if not is_admin_user(interaction.user):
@@ -4279,7 +4322,6 @@ async def admin_lista_classe(interaction: discord.Interaction, classe: str):
 @app_commands.describe(
     usuario="Usuário do Discord"
 )
-@app_commands.default_permissions(administrator=True)
 async def admin_progresso_player(interaction: discord.Interaction, usuario: discord.Member):
     """Mostra histórico de progressão de um player (apenas administradores)"""
     if not is_admin_user(interaction.user):
@@ -4485,7 +4527,6 @@ async def admin_progresso_player(interaction: discord.Interaction, usuario: disc
     usuario="Usuário do Discord para excluir o registro",
     confirmar="Digite 'CONFIRMAR' para executar a exclusão (case-sensitive)"
 )
-@app_commands.default_permissions(administrator=True)
 async def admin_excluir_registro(interaction: discord.Interaction, usuario: discord.Member, confirmar: str):
     """Exclui o registro de gearscore de um membro (apenas administradores)"""
     if not is_admin_user(interaction.user):
@@ -4562,7 +4603,6 @@ async def admin_excluir_registro(interaction: discord.Interaction, usuario: disc
     linkgear="Novo link do gear (deixe vazio para manter atual)"
 )
 @app_commands.autocomplete(classe_pvp=classe_autocomplete)
-@app_commands.default_permissions(administrator=True)
 async def admin_alterar_registro(
     interaction: discord.Interaction,
     usuario: discord.Member,
@@ -4696,7 +4736,6 @@ async def admin_alterar_registro(
             )
 
 @bot.tree.command(name="admin_sincronizar_nomes", description="[ADMIN] Sincroniza os nicknames de todos os membros com seus nomes de família")
-@app_commands.default_permissions(administrator=True)
 async def admin_sincronizar_nomes(interaction: discord.Interaction):
     """Sincroniza os nicknames de todos os membros registrados com seus nomes de família (apenas administradores)"""
     if not is_admin_user(interaction.user):
@@ -4831,7 +4870,6 @@ async def admin_sincronizar_nomes(interaction: discord.Interaction):
 @app_commands.describe(
     mensagem_id="ID da mensagem do Apollo (clique direito na mensagem > Copiar ID)"
 )
-@app_commands.default_permissions(administrator=True)
 async def gs_evento(interaction: discord.Interaction, mensagem_id: str):
     """Busca o GS dos participantes listados em uma mensagem do Apollo"""
     if not is_admin_user(interaction.user):
@@ -5130,7 +5168,6 @@ class GSListaModal(discord.ui.Modal, title="📋 Buscar GS por Lista de Nomes"):
         await interaction.followup.send(embed=embed, ephemeral=True)
 
 @bot.tree.command(name="gs_lista", description="[ADMIN] Busca o GS de uma lista de jogadores (cole os nomes)")
-@app_commands.default_permissions(administrator=True)
 async def gs_lista(interaction: discord.Interaction):
     """Abre um modal para colar uma lista de nomes e buscar o GS de cada um"""
     if not is_admin_user(interaction.user):
@@ -5146,7 +5183,6 @@ async def gs_lista(interaction: discord.Interaction):
 @app_commands.describe(
     nomes="Nomes dos jogadores separados por vírgula (ex: DaVila, Arehasa, Xr)"
 )
-@app_commands.default_permissions(administrator=True)
 async def gs_media(interaction: discord.Interaction, nomes: str):
     """Calcula a média de GS de uma lista de jogadores pelo nome de família"""
     if not is_admin_user(interaction.user):
@@ -5289,7 +5325,6 @@ async def gs_media(interaction: discord.Interaction, nomes: str):
             )
 
 @bot.tree.command(name="gs_abaixo_media", description="[ADMIN] Lista players abaixo do GS médio da guilda")
-@app_commands.default_permissions(administrator=True)
 async def gs_abaixo_media(interaction: discord.Interaction):
     """Lista todos os players que estão abaixo do GS médio da guilda com suas builds"""
     if not is_admin_user(interaction.user):
@@ -5476,8 +5511,7 @@ async def gs_abaixo_media(interaction: discord.Interaction):
 #     app_commands.Choice(name="Tudo (Gearscore + Histórico)", value="tudo"),
 #     app_commands.Choice(name="Apenas Histórico", value="historico")
 # ])
-# @app_commands.default_permissions(administrator=True)
-# async def admin_limpar_banco(interaction: discord.Interaction, tipo: app_commands.Choice[str], confirmar: str):
+# # async def admin_limpar_banco(interaction: discord.Interaction, tipo: app_commands.Choice[str], confirmar: str):
 #     """Limpa o banco de dados (apenas administradores)"""
 #     if not interaction.user.guild_permissions.administrator:
 #         await interaction.response.send_message(
@@ -5538,7 +5572,6 @@ async def gs_abaixo_media(interaction: discord.Interaction):
     classe="Classe a ser analisada (digite para buscar)"
 )
 @app_commands.autocomplete(classe=classe_autocomplete)
-@app_commands.default_permissions(administrator=True)
 async def analise_classe(interaction: discord.Interaction, classe: str):
     """Análise completa de uma classe com relatório detalhado de todos os membros (apenas administradores)"""
     if not is_admin_user(interaction.user):
@@ -5734,7 +5767,6 @@ async def analise_classe(interaction: discord.Interaction, classe: str):
             )
 
 @bot.tree.command(name="admin_membros_sem_registro", description="[ADMIN] Lista membros com cargo da guilda que ainda não registraram gearscore")
-@app_commands.default_permissions(administrator=True)
 async def admin_membros_sem_registro(interaction: discord.Interaction):
     """Lista membros com cargo da guilda que ainda não fizeram registro (apenas administradores)"""
     if not is_admin_user(interaction.user):
@@ -5850,7 +5882,6 @@ async def admin_membros_sem_registro(interaction: discord.Interaction):
             )
 
 @bot.tree.command(name="admin_enviar_lembretes", description="[ADMIN] Envia lembretes de atualização de GS manualmente")
-@app_commands.default_permissions(administrator=True)
 async def admin_enviar_lembretes(interaction: discord.Interaction):
     """Envia lembretes de atualização de GS manualmente (apenas administradores)"""
     if not is_admin_user(interaction.user):
@@ -5901,7 +5932,6 @@ async def admin_enviar_lembretes(interaction: discord.Interaction):
 @app_commands.describe(
     dias="Número de dias sem atualizar (padrão: configuração do bot)"
 )
-@app_commands.default_permissions(administrator=True)
 async def admin_gs_desatualizados(interaction: discord.Interaction, dias: int = None):
     """Lista membros que não atualizaram GS há X dias (apenas administradores)"""
     if not is_admin_user(interaction.user):
@@ -6832,7 +6862,6 @@ class CensoModal(discord.ui.Modal):
     exemplo_gear="Imagem de exemplo da Gear (anexe a imagem)",
     exemplo_passiva="Imagem de exemplo da Passiva do Node (anexe a imagem)"
 )
-@app_commands.default_permissions(administrator=True)
 async def criar_censo(interaction: discord.Interaction, exemplo_gear: discord.Attachment = None, exemplo_passiva: discord.Attachment = None):
     """Cria um novo evento de censo. Use estrutura fixa (deixe campos vazios) ou defina campos personalizados."""
     if not is_admin_user(interaction.user):
@@ -7072,7 +7101,6 @@ async def preencher_censo(interaction: discord.Interaction):
             )
 
 @bot.tree.command(name="censo_status", description="[ADMIN] Verifica status do censo (quem preencheu e quem não preencheu)")
-@app_commands.default_permissions(administrator=True)
 async def censo_status(interaction: discord.Interaction):
     """Mostra quem preencheu e quem não preencheu o censo"""
     if not is_admin_user(interaction.user):
@@ -7209,7 +7237,6 @@ async def censo_status(interaction: discord.Interaction):
         )
 
 @bot.tree.command(name="censo_reenviar_sheets", description="[ADMIN] Reenvia todos os dados do censo para o Google Sheets")
-@app_commands.default_permissions(administrator=True)
 async def censo_reenviar_sheets(interaction: discord.Interaction):
     """Reenvia todas as respostas do censo ativo para o Google Sheets"""
     if not is_admin_user(interaction.user):
@@ -7352,7 +7379,6 @@ async def censo_reenviar_sheets(interaction: discord.Interaction):
         )
 
 @bot.tree.command(name="censo_finalizar", description="[ADMIN] Finaliza o censo e aplica tags finais")
-@app_commands.default_permissions(administrator=True)
 async def censo_finalizar(interaction: discord.Interaction):
     """Finaliza o censo e aplica tags finais (Censo Completo / Sem Censo)"""
     if not is_admin_user(interaction.user):
