@@ -78,7 +78,7 @@ GOOGLE_SHEETS_CREDENTIALS_PATH = os.getenv('GOOGLE_SHEETS_CREDENTIALS_PATH', 'cr
 
 
 # Lista de classes do Black Desert Online (ordem alfabética)
-# Total: 30 classes - Discord mostra 25, usuário deve DIGITAR para filtrar
+# Total: 31 classes - Discord mostra 25, usuário deve DIGITAR para filtrar
 BDO_CLASSES = [
     "Arqueiro",
     "Berserker",
@@ -102,6 +102,7 @@ BDO_CLASSES = [
     "Nova",
     "Ranger",
     "Sage",
+    "Savior",
     "Scholar",
     "Shai",
     "Striker",
