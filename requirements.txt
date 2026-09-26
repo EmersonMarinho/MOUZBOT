@@ -2,6 +2,10 @@ discord.py>=2.3.2
 python-dotenv>=1.0.0
 pytz>=2023.3
 
+# Para gerar os gráficos do /hp_efetivo:
+matplotlib>=3.8.0
+numpy>=1.26.0
+
 # Dependências opcionais para bancos de dados cloud:
 # Para PostgreSQL (Supabase, Railway, Neon):
 psycopg2-binary>=2.9.9

@@ -3,11 +3,13 @@ from discord import app_commands
 from discord.ext import commands, tasks
 import os
 import io
+import asyncio
 import logging
 from datetime import datetime
 from pytz import timezone
 from config import DISCORD_TOKEN, BDO_CLASSES, DATABASE_NAME, DATABASE_URL, ALLOWED_DM_ROLES, NOTIFICATION_CHANNEL_ID, GUILD_MEMBER_ROLE_ID, DM_REPORT_CHANNEL_ID, LIST_CHANNEL_ID, MOVE_LOG_CHANNEL_ID, REGISTERED_ROLE_ID, UNREGISTERED_ROLE_ID, GS_UPDATE_REMINDER_DAYS, GS_REMINDER_CHECK_HOUR, ADMIN_USER_IDS, ADMIN_ROLE_IDS, CENSO_COMPLETO_ROLE_ID, SEM_CENSO_ROLE_ID, GOOGLE_SHEETS_ENABLED, GOOGLE_SHEETS_SPREADSHEET_ID, GOOGLE_SHEETS_WORKSHEET_NAME, GOOGLE_SHEETS_CREDENTIALS_PATH
 from datetime import timedelta
+import hp_efetivo
 # Importar o banco de dados apropriado
 if DATABASE_URL:
     from database_postgres import Database
@@ -1896,6 +1898,102 @@ async def perfil(interaction: discord.Interaction):
                 f"❌ Erro ao buscar perfil: {str(e)}",
                 ephemeral=True
             )
+
+@bot.tree.command(name="hp_efetivo", description="Mostra quanto de vida você REALMENTE tem contra um inimigo e se vale subir DR ou Evasão")
+@app_commands.describe(
+    vida="Sua vida máxima (HP)",
+    dr="Sua DR (Redução de Dano), aparece na janela de atributos",
+    evasao="Sua Evasão, aparece na janela de atributos",
+    reducao_dano="Redução de dano em % (ex.: 30 para 30%). Se não sabe, deixe vazio",
+    ap_inimigo="AP do inimigo. Se não sabe, deixe vazio (usa 1100)",
+    precisao_inimigo="Precisão do inimigo. Se não sabe, deixe vazio (usa 1330)"
+)
+async def hp_efetivo_cmd(
+    interaction: discord.Interaction,
+    vida: app_commands.Range[int, 1, 1000000],
+    dr: app_commands.Range[int, 0, 5000],
+    evasao: app_commands.Range[int, 0, 5000],
+    reducao_dano: app_commands.Range[int, 0, 90] = 0,
+    ap_inimigo: app_commands.Range[int, 1, 5000] = 1100,
+    precisao_inimigo: app_commands.Range[int, 0, 5000] = 1330
+):
+    try:
+        await interaction.response.defer(ephemeral=True)
+
+        res = hp_efetivo.calcular(vida, dr, evasao, reducao_dano / 100, ap_inimigo, precisao_inimigo)
+        imagem = await asyncio.to_thread(hp_efetivo.gerar_grafico, res)
+
+        fmt = hp_efetivo.formatar_numero
+        dec = hp_efetivo.formatar_decimal
+        status_zona = {
+            hp_efetivo.ZONA_BOA: "🟢 Subir **ajuda**",
+            hp_efetivo.ZONA_MENOS: "🟡 Subir ainda ajuda, mas **rende menos**",
+            hp_efetivo.ZONA_NADA: "⚪ Subir **não ajuda nada** contra esse inimigo",
+        }
+
+        embed = discord.Embed(
+            title="🛡️ Sua Vida Efetiva",
+            description=(
+                f"Contra um inimigo com **AP {ap_inimigo}** e **Precisão {precisao_inimigo}**, "
+                f"é como se você tivesse **{fmt(res['hp_efetivo'])} de vida**.\n"
+                f"Sua vida de verdade é {fmt(vida)}, ou seja, sua defesa faz você aguentar "
+                f"**{dec(res['multiplicador'])}x mais** dano."
+            ),
+            color=discord.Color.orange()
+        )
+        embed.add_field(
+            name="🎯 O inimigo erra em você",
+            value=f"**{dec(res['miss'] * 100)}%** dos golpes (golpe errado dá menos dano)",
+            inline=False
+        )
+        embed.add_field(
+            name=f"🧱 Sua DR: {dr}",
+            value=(
+                f"{status_zona[res['zona_dr_atual']]}\n"
+                f"+{hp_efetivo.PONTOS_TESTE} de DR = **+{dec(res['ganho_dr'], 2)}%** de vida efetiva"
+            ),
+            inline=True
+        )
+        embed.add_field(
+            name=f"💨 Sua Evasão: {evasao}",
+            value=(
+                f"{status_zona[res['zona_evasao_atual']]}\n"
+                f"+{hp_efetivo.PONTOS_TESTE} de Evasão = **+{dec(res['ganho_evasao'], 2)}%** de vida efetiva"
+            ),
+            inline=True
+        )
+        embed.add_field(
+            name="👉 O QUE FAZER",
+            value=f"**{hp_efetivo.recomendacao(res)}**",
+            inline=False
+        )
+        embed.add_field(
+            name="📖 Como ler o gráfico",
+            value=(
+                "• A **bolinha laranja** é você.\n"
+                "• **Linha mais alta** = você aguenta mais.\n"
+                "• Fundo 🟢 verde = subir ajuda | 🟡 amarelo = ajuda menos | ⚪ cinza = não ajuda nada."
+            ),
+            inline=False
+        )
+        embed.set_image(url="attachment://hp_efetivo.png")
+        embed.set_footer(text=(
+            f"Redução de dano usada: {reducao_dano}% | "
+            f"Fórmula baseada nos testes do @gpw"
+        ))
+
+        await interaction.followup.send(
+            embed=embed,
+            file=discord.File(imagem, filename="hp_efetivo.png"),
+            ephemeral=True
+        )
+
+    except Exception as e:
+        logger.error(f"Erro ao calcular HP efetivo: {e}")
+        if interaction.response.is_done():
+            await interaction.followup.send(f"❌ Erro ao calcular HP efetivo: {str(e)}", ephemeral=True)
+        else:
+            await interaction.response.send_message(f"❌ Erro ao calcular HP efetivo: {str(e)}", ephemeral=True)
 
 @bot.tree.command(name="pre", description="[ADMIN] Visualiza o perfil de outro membro")
 @app_commands.describe(usuario="Usuário para visualizar o perfil")
