@@ -1904,7 +1904,7 @@ async def perfil(interaction: discord.Interaction):
     vida="Sua vida máxima (HP)",
     dr="Sua DR (Redução de Dano), aparece na janela de atributos",
     evasao="Sua Evasão, aparece na janela de atributos",
-    reducao_dano="Redução de dano em % (ex.: 30 para 30%). Se não sabe, deixe vazio",
+    reducao_dano="Redução de dano em %. Se não sabe, deixe vazio (usa 30%)",
     ap_inimigo="AP do inimigo. Se não sabe, deixe vazio (usa 1100)",
     precisao_inimigo="Precisão do inimigo. Se não sabe, deixe vazio (usa 1330)"
 )
@@ -1913,7 +1913,7 @@ async def hp_efetivo_cmd(
     vida: app_commands.Range[int, 1, 1000000],
     dr: app_commands.Range[int, 0, 5000],
     evasao: app_commands.Range[int, 0, 5000],
-    reducao_dano: app_commands.Range[int, 0, 90] = 0,
+    reducao_dano: app_commands.Range[int, 0, 90] = 30,
     ap_inimigo: app_commands.Range[int, 1, 5000] = 1100,
     precisao_inimigo: app_commands.Range[int, 0, 5000] = 1330
 ):
