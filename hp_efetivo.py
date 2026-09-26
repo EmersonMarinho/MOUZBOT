@@ -1,5 +1,5 @@
 """
-Cálculo de HP efetivo (vida efetiva) contra um atacante, com gráficos para o Discord.
+Cálculo de HP efetivo (vida efetiva) e dano efetivo, com gráficos para o Discord.
 
 Fórmula baseada nos testes empíricos feitos pelo @gpw:
 https://docs.google.com/spreadsheets/d/14DlYeauGCtIw-6FuJ2LVNLPA-hKpEOTseOvL3b6aKh4
@@ -34,6 +34,8 @@ CORES = {
     "grade": "#4e5058",
     "curva_dr": "#5b9cf5",
     "curva_evasao": "#3fc488",
+    "curva_ap": "#f0616d",
+    "curva_precisao": "#b07cf7",
     "voce": "#ff7a3d",
     "vida_real": "#f2f3f5",
     ZONA_BOA: "#3fc488",
@@ -47,18 +49,29 @@ TEXTO_ZONA = {
     ZONA_NADA: "NÃO AJUDA NADA",
 }
 
+TEXTO_ZONA_AP = {
+    ZONA_BOA: "SUBIR AJUDA",
+    ZONA_MENOS: "RENDE MENOS",
+    ZONA_NADA: "RENDE QUASE NADA",
+}
+
 
 def calculo_miss(precisao, evasao):
     """Chance de o atacante errar, baseada na precisão dele e na sua evasão."""
     return min(max(MISS_BASE + MISS_PONTO * (evasao - precisao), 0), MISS_MAX)
 
 
-def hpe(vida, ap, miss, dr, drp):
-    """HP efetivo: quanto de dano 'sem defesa' seria preciso para te matar."""
+def dano_medio(ap, miss, dr, drp):
+    """Dano médio que um golpe de AP causa em quem tem essa DR, chance de erro e DRP."""
     dano_acerto = max(ap - dr, DANO_MINIMO * ap)                    # Um acerto interage apenas com a DR.
     dano_erro = max(dano_acerto * (1 - miss), DANO_MINIMO * ap)     # Um erro pega o dano do acerto e diminui pela chance de errar.
-    # Média ponderada de acertos e erros, dividida pelo AP (quanto do AP passa), e por fim o DRP (redutor global)
-    f = ((1 - miss) * dano_acerto + miss * dano_erro) / ap * (1 - drp)
+    # Média ponderada de acertos e erros, e por fim o DRP (redutor global)
+    return ((1 - miss) * dano_acerto + miss * dano_erro) * (1 - drp)
+
+
+def hpe(vida, ap, miss, dr, drp):
+    """HP efetivo: quanto de dano 'sem defesa' seria preciso para te matar."""
+    f = dano_medio(ap, miss, dr, drp) / ap      # Quanto do AP passa (como já tem o DANO_MINIMO embutido, nunca é zero)
     return vida / f
 
 
@@ -166,7 +179,8 @@ def recomendacao(res):
     return "TANTO FAZ: DR e Evasão rendem quase igual contra esse inimigo."
 
 
-def _desenhar_painel(ax, titulo, nome_x, xs, ys, zonas, x_atual, y_atual, vida, cor_curva, rotulo_atual):
+def _desenhar_painel(ax, titulo, nome_x, xs, ys, zonas, x_atual, y_atual, cor_curva, rotulo_atual,
+                     nome_y="Vida efetiva", referencia=None, textos_zona=TEXTO_ZONA):
     ax.set_facecolor(CORES["painel"])
     x_max = xs[-1]
 
@@ -175,14 +189,16 @@ def _desenhar_painel(ax, titulo, nome_x, xs, ys, zonas, x_atual, y_atual, vida, 
     for inicio, fim, zona in zonas:
         ax.axvspan(inicio, fim, color=CORES[zona], alpha=0.16, linewidth=0)
         if (fim - inicio) / x_max >= 0.12:
-            ax.text((inicio + fim) / 2, y_topo * 0.97, TEXTO_ZONA[zona],
+            ax.text((inicio + fim) / 2, y_topo * 0.97, textos_zona[zona],
                     ha="center", va="top", fontsize=11, fontweight="bold", color=CORES[zona])
 
-    # Vida real (sem defesa) como referência
-    ax.axhline(vida, color=CORES["vida_real"], linestyle="--", linewidth=1.2, alpha=0.6)
-    ax.text(x_max * 0.99, vida, f"sua vida de verdade: {formatar_numero(vida)}",
-            va="bottom", ha="right", fontsize=10, color=CORES["texto_suave"],
-            bbox=dict(boxstyle="round,pad=0.2", fc=CORES["painel"], ec="none", alpha=0.85))
+    # Linha de referência (ex.: vida real, sem defesa)
+    if referencia:
+        valor_ref, texto_ref = referencia
+        ax.axhline(valor_ref, color=CORES["vida_real"], linestyle="--", linewidth=1.2, alpha=0.6)
+        ax.text(x_max * 0.99, valor_ref, texto_ref,
+                va="bottom", ha="right", fontsize=10, color=CORES["texto_suave"],
+                bbox=dict(boxstyle="round,pad=0.2", fc=CORES["painel"], ec="none", alpha=0.85))
 
     # Curva
     ax.plot(xs, ys, color=cor_curva, linewidth=3.5)
@@ -207,7 +223,7 @@ def _desenhar_painel(ax, titulo, nome_x, xs, ys, zonas, x_atual, y_atual, vida, 
 
     ax.set_title(titulo, fontsize=16, fontweight="bold", color=CORES["texto"], loc="left", pad=12)
     ax.set_xlabel(nome_x, fontsize=12, color=CORES["texto"])
-    ax.set_ylabel("Vida efetiva", fontsize=12, color=CORES["texto"])
+    ax.set_ylabel(nome_y, fontsize=12, color=CORES["texto"])
     ax.set_xlim(0, x_max)
     ax.set_ylim(0, y_topo)
     ax.yaxis.set_major_formatter(FuncFormatter(lambda v, _: formatar_numero(v)))
@@ -223,6 +239,7 @@ def gerar_grafico(res):
     ax_dr, ax_evasao = fig.subplots(2, 1)
 
     hp_txt = formatar_numero(res["hp_efetivo"])
+    vida_real = (res["vida"], f"sua vida de verdade: {formatar_numero(res['vida'])}")
     fig.suptitle(
         f"Sua vida efetiva: {hp_txt}   (sua vida real: {formatar_numero(res['vida'])})\n"
         f"Contra um inimigo com AP {res['ap']} e Precisão {res['precisao']}",
@@ -232,14 +249,16 @@ def gerar_grafico(res):
     _desenhar_painel(
         ax_dr, "1) E SE EU MUDAR MINHA DR?  (o resto fica igual)", "Sua DR",
         res["dr_range"], res["hpe_dr"], res["zonas_dr"],
-        res["dr"], res["hp_efetivo"], res["vida"], CORES["curva_dr"],
+        res["dr"], res["hp_efetivo"], CORES["curva_dr"],
         f"DR {res['dr']} = {hp_txt} de vida",
+        referencia=vida_real,
     )
     _desenhar_painel(
         ax_evasao, "2) E SE EU MUDAR MINHA EVASÃO?  (o resto fica igual)", "Sua Evasão",
         res["evasao_range"], res["hpe_evasao"], res["zonas_evasao"],
-        res["evasao"], res["hp_efetivo"], res["vida"], CORES["curva_evasao"],
+        res["evasao"], res["hp_efetivo"], CORES["curva_evasao"],
         f"Evasão {res['evasao']} = {hp_txt} de vida",
+        referencia=vida_real,
     )
 
     fig.text(
@@ -248,9 +267,129 @@ def gerar_grafico(res):
         f"RESPOSTA: {recomendacao(res)}",
         ha="center", va="bottom", fontsize=13, fontweight="bold", color=CORES["texto"],
     )
-    fig.subplots_adjust(left=0.1, right=0.97, top=0.9, bottom=0.1, hspace=0.35)
+    return _salvar(fig)
 
+
+def _salvar(fig):
+    fig.subplots_adjust(left=0.1, right=0.97, top=0.9, bottom=0.1, hspace=0.35)
     buffer = io.BytesIO()
     fig.savefig(buffer, format="png", facecolor=fig.get_facecolor())
     buffer.seek(0)
     return buffer
+
+
+# ================================================================
+# DANO EFETIVO (visão de quem ataca)
+# ================================================================
+
+def calcular_dano(ap, precisao, dr, evasao, drp):
+    """
+    Mesmas contas do HP efetivo, mas do lado do atacante: quanto do seu AP chega no inimigo.
+    drp vem como fração (0.3 = 30%).
+    """
+    miss = calculo_miss(precisao, evasao)
+    dano = dano_medio(ap, miss, dr, drp)
+
+    # AP: abaixo disso seu golpe acertado já está no dano mínimo (5%), o AP quase não passa a DR dele
+    ap_passa = dr / (1 - DANO_MINIMO)
+    # AP: a partir do cotovelo até o golpe errado passa do dano mínimo, cada ponto de AP rende o máximo
+    ap_cotovelo = dr / (1 - DANO_MINIMO / (1 - miss))
+
+    # Precisão: abaixo disso ele já desvia o máximo (90%); acima disso ele não desvia mais nada
+    precisao_inicio = round(evasao - (MISS_MAX - MISS_BASE) / MISS_PONTO)
+    precisao_check = round(evasao + MISS_BASE / MISS_PONTO)
+    # Se até o golpe acertado está no dano mínimo, acertar ou errar dá no mesmo: precisão não ajuda
+    precisao_inutil = (ap - dr) <= DANO_MINIMO * ap
+
+    # Curvas
+    ap_max = max(ap * 1.5, ap_cotovelo * 1.15)
+    ap_range = np.arange(0, ap_max, 1)
+    dano_ap = np.array([dano_medio(x, miss, dr, drp) for x in ap_range])
+
+    precisao_max = max(precisao, precisao_check) * 1.1
+    precisao_range = np.arange(0, precisao_max, 1)
+    dano_precisao = np.array([dano_medio(ap, calculo_miss(x, evasao), dr, drp) for x in precisao_range])
+
+    zonas_ap = [
+        (0, ap_passa, ZONA_NADA),
+        (ap_passa, ap_cotovelo, ZONA_MENOS),
+        (ap_cotovelo, ap_max, ZONA_BOA),
+    ]
+    if precisao_inutil:
+        zonas_precisao = [(0, precisao_max, ZONA_NADA)]
+    else:
+        zonas_precisao = [
+            (0, max(precisao_inicio, 0), ZONA_NADA),
+            (max(precisao_inicio, 0), precisao_check, ZONA_BOA),
+            (precisao_check, precisao_max, ZONA_NADA),
+        ]
+    zonas_ap = [z for z in zonas_ap if z[1] > z[0]]
+    zonas_precisao = [z for z in zonas_precisao if z[1] > z[0]]
+
+    # Quanto o dano sobe se ganhar alguns pontos de cada atributo
+    ganho_ap = (dano_medio(ap + PONTOS_TESTE, miss, dr, drp) / dano - 1) * 100
+    ganho_precisao = (dano_medio(ap, calculo_miss(precisao + PONTOS_TESTE, evasao), dr, drp) / dano - 1) * 100
+
+    return {
+        "ap": ap, "precisao": precisao, "dr": dr, "evasao": evasao, "drp": drp,
+        "miss": miss,
+        "dano": dano,
+        "porcentagem": dano / ap * 100,
+        "ap_passa": round(ap_passa), "ap_cotovelo": round(ap_cotovelo),
+        "precisao_inicio": precisao_inicio, "precisao_check": precisao_check,
+        "precisao_inutil": precisao_inutil,
+        "ap_range": ap_range, "dano_ap": dano_ap,
+        "precisao_range": precisao_range, "dano_precisao": dano_precisao,
+        "zonas_ap": zonas_ap, "zonas_precisao": zonas_precisao,
+        "zona_ap_atual": _zona_em(ap, zonas_ap),
+        "zona_precisao_atual": _zona_em(precisao, zonas_precisao),
+        "ganho_ap": ganho_ap, "ganho_precisao": ganho_precisao,
+    }
+
+
+def recomendacao_dano(res):
+    """Frase curta dizendo o que vale mais a pena subir para bater mais."""
+    ganho_ap, ganho_precisao = res["ganho_ap"], res["ganho_precisao"]
+    if ganho_ap < 0.05 and ganho_precisao < 0.05:
+        return "NENHUM DOS DOIS: contra esse inimigo subir AP ou Precisão quase não muda nada."
+    if ganho_ap >= ganho_precisao * 1.2:
+        return "SUBA AP. Contra esse inimigo ele rende mais que Precisão."
+    if ganho_precisao >= ganho_ap * 1.2:
+        return "SUBA PRECISÃO. Contra esse inimigo ela rende mais que AP."
+    return "TANTO FAZ: AP e Precisão rendem quase igual contra esse inimigo."
+
+
+def gerar_grafico_dano(res):
+    """Gera a imagem PNG do dano efetivo e devolve um BytesIO pronto para discord.File."""
+    fig = Figure(figsize=(11, 12.5), dpi=100, facecolor=CORES["fundo"])
+    ax_ap, ax_precisao = fig.subplots(2, 1)
+
+    dano_txt = formatar_numero(res["dano"])
+    fig.suptitle(
+        f"Seu dano efetivo: {dano_txt} por golpe   (seu AP: {res['ap']})\n"
+        f"Contra um inimigo com DR {res['dr']}, Evasão {res['evasao']} e {round(res['drp'] * 100)}% de redução",
+        fontsize=17, fontweight="bold", color=CORES["texto"], y=0.985,
+    )
+
+    _desenhar_painel(
+        ax_ap, "1) E SE EU MUDAR MEU AP?  (o resto fica igual)", "Seu AP",
+        res["ap_range"], res["dano_ap"], res["zonas_ap"],
+        res["ap"], res["dano"], CORES["curva_ap"],
+        f"AP {res['ap']} = {dano_txt} de dano",
+        nome_y="Dano que chega nele", textos_zona=TEXTO_ZONA_AP,
+    )
+    _desenhar_painel(
+        ax_precisao, "2) E SE EU MUDAR MINHA PRECISÃO?  (o resto fica igual)", "Sua Precisão",
+        res["precisao_range"], res["dano_precisao"], res["zonas_precisao"],
+        res["precisao"], res["dano"], CORES["curva_precisao"],
+        f"Precisão {res['precisao']} = {dano_txt} de dano",
+        nome_y="Dano que chega nele",
+    )
+
+    fig.text(
+        0.5, 0.012,
+        "Linha mais alta = você bate mais.   Bolinha laranja = você.\n"
+        f"RESPOSTA: {recomendacao_dano(res)}",
+        ha="center", va="bottom", fontsize=13, fontweight="bold", color=CORES["texto"],
+    )
+    return _salvar(fig)

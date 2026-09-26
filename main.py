@@ -1995,6 +1995,108 @@ async def hp_efetivo_cmd(
         else:
             await interaction.response.send_message(f"❌ Erro ao calcular HP efetivo: {str(e)}", ephemeral=True)
 
+@bot.tree.command(name="dano_efetivo", description="Mostra quanto do seu dano REALMENTE chega no inimigo e se vale subir AP ou Precisão")
+@app_commands.describe(
+    ap="Seu AP, aparece na janela de atributos",
+    precisao="Sua Precisão, aparece na janela de atributos",
+    dr_inimigo="DR do inimigo. Se não sabe, deixe vazio (usa 850)",
+    evasao_inimigo="Evasão do inimigo. Se não sabe, deixe vazio (usa 1250)",
+    reducao_dano_inimigo="Redução de dano do inimigo em %. Se não sabe, deixe vazio (usa 30%)"
+)
+async def dano_efetivo_cmd(
+    interaction: discord.Interaction,
+    ap: app_commands.Range[int, 1, 5000],
+    precisao: app_commands.Range[int, 0, 5000],
+    dr_inimigo: app_commands.Range[int, 0, 5000] = 850,
+    evasao_inimigo: app_commands.Range[int, 0, 5000] = 1250,
+    reducao_dano_inimigo: app_commands.Range[int, 0, 90] = 30
+):
+    try:
+        await interaction.response.defer(ephemeral=True)
+
+        res = hp_efetivo.calcular_dano(ap, precisao, dr_inimigo, evasao_inimigo, reducao_dano_inimigo / 100)
+        imagem = await asyncio.to_thread(hp_efetivo.gerar_grafico_dano, res)
+
+        fmt = hp_efetivo.formatar_numero
+        dec = hp_efetivo.formatar_decimal
+
+        status_ap = {
+            hp_efetivo.ZONA_BOA: "🟢 Subir **ajuda**",
+            hp_efetivo.ZONA_MENOS: "🟡 Subir ajuda, mas **rende menos**",
+            hp_efetivo.ZONA_NADA: "⚪ Seu AP **quase não passa** a DR dele",
+        }
+        if res["zona_precisao_atual"] == hp_efetivo.ZONA_BOA:
+            status_precisao = "🟢 Subir **ajuda**"
+        elif res["precisao_inutil"]:
+            status_precisao = "⚪ Subir **não ajuda nada**: seu AP não passa a DR dele"
+        elif precisao >= res["precisao_check"]:
+            status_precisao = "⚪ Subir **não ajuda nada**: ele já não desvia de você"
+        else:
+            status_precisao = "⚪ Subir **não ajuda nada** ainda: ele desvia demais"
+
+        embed = discord.Embed(
+            title="⚔️ Seu Dano Efetivo",
+            description=(
+                f"Contra um inimigo com **DR {dr_inimigo}**, **Evasão {evasao_inimigo}** "
+                f"e **{reducao_dano_inimigo}% de redução de dano**:\n"
+                f"de cada **100** de dano que você bate, só **{dec(res['porcentagem'])}** chegam nele.\n"
+                f"Na média, cada golpe seu causa **{fmt(res['dano'])} de dano** (seu AP é {ap})."
+            ),
+            color=discord.Color.red()
+        )
+        embed.add_field(
+            name="🎯 Ele desvia de você",
+            value=f"**{dec(res['miss'] * 100)}%** dos golpes (golpe desviado dá menos dano)",
+            inline=False
+        )
+        embed.add_field(
+            name=f"⚔️ Seu AP: {ap}",
+            value=(
+                f"{status_ap[res['zona_ap_atual']]}\n"
+                f"+{hp_efetivo.PONTOS_TESTE} de AP = **+{dec(res['ganho_ap'], 2)}%** de dano\n"
+                f"Passa a DR dele a partir de **{res['ap_passa']}**, rende o máximo a partir de **{res['ap_cotovelo']}**"
+            ),
+            inline=True
+        )
+        embed.add_field(
+            name=f"🎯 Sua Precisão: {precisao}",
+            value=(
+                f"{status_precisao}\n"
+                f"+{hp_efetivo.PONTOS_TESTE} de Precisão = **+{dec(res['ganho_precisao'], 2)}%** de dano\n"
+                f"Começa a contar em **{max(res['precisao_inicio'], 0)}**, a partir de **{res['precisao_check']}** ele não desvia mais"
+            ),
+            inline=True
+        )
+        embed.add_field(
+            name="👉 O QUE FAZER",
+            value=f"**{hp_efetivo.recomendacao_dano(res)}**",
+            inline=False
+        )
+        embed.add_field(
+            name="📖 Como ler o gráfico",
+            value=(
+                "• A **bolinha laranja** é você.\n"
+                "• **Linha mais alta** = você bate mais.\n"
+                "• Fundo 🟢 verde = subir ajuda | 🟡 amarelo = rende menos | ⚪ cinza = quase não ajuda / não ajuda nada."
+            ),
+            inline=False
+        )
+        embed.set_image(url="attachment://dano_efetivo.png")
+        embed.set_footer(text="Fórmula baseada nos testes do @gpw")
+
+        await interaction.followup.send(
+            embed=embed,
+            file=discord.File(imagem, filename="dano_efetivo.png"),
+            ephemeral=True
+        )
+
+    except Exception as e:
+        logger.error(f"Erro ao calcular dano efetivo: {e}")
+        if interaction.response.is_done():
+            await interaction.followup.send(f"❌ Erro ao calcular dano efetivo: {str(e)}", ephemeral=True)
+        else:
+            await interaction.response.send_message(f"❌ Erro ao calcular dano efetivo: {str(e)}", ephemeral=True)
+
 @bot.tree.command(name="pre", description="[ADMIN] Visualiza o perfil de outro membro")
 @app_commands.describe(usuario="Usuário para visualizar o perfil")
 async def pre(interaction: discord.Interaction, usuario: discord.Member):
