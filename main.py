@@ -423,6 +423,32 @@ async def get_guild_member_ids(guild: discord.Guild) -> set:
     
     return member_ids
 
+# Função helper para obter a guilda da interação (inclusive quando usada via DM)
+async def resolve_interaction_guild(interaction: discord.Interaction):
+    """
+    Retorna a guilda da interação.
+    Em DM, retorna a guilda do bot onde o usuário é membro e possui o cargo da guilda.
+    Retorna: (guild, erro) - erro é None quando a guilda foi resolvida
+    """
+    if interaction.guild:
+        return interaction.guild, None
+
+    found_member = False
+    for guild in interaction.client.guilds:
+        member = guild.get_member(interaction.user.id)
+        if member is None:
+            try:
+                member = await guild.fetch_member(interaction.user.id)
+            except (discord.NotFound, discord.Forbidden, discord.HTTPException):
+                continue
+        found_member = True
+        if has_guild_role(member):
+            return guild, None
+
+    if found_member:
+        return None, "❌ Você não possui o cargo da guilda no Discord. Só membros da guilda podem atualizar o gearscore."
+    return None, "❌ Não encontrei você no servidor da guilda. Use este comando no servidor."
+
 # Função helper para atualizar o nickname do membro para o nome de família
 async def update_member_nickname(member: discord.Member, family_name: str) -> tuple:
     """
@@ -1417,7 +1443,14 @@ async def atualizar(
             return
         
         user_id = str(interaction.user.id)
-        
+
+        # Resolver a guilda (interaction.guild é None quando o comando é usado via DM)
+        guild, guild_error = await resolve_interaction_guild(interaction)
+        if not guild:
+            logger.warning(f"/atualizar via DM negado para {interaction.user} (ID: {user_id}): {guild_error}")
+            await interaction.followup.send(guild_error, ephemeral=True)
+            return
+
         # Verificar se já existe registro
         current_data = db.get_user_current_data(user_id)
         if not current_data:
@@ -1513,7 +1546,7 @@ async def atualizar(
         # Atualizar nickname se o nome de família mudou
         nickname_updated = False
         nickname_error = None
-        member = interaction.guild.get_member(interaction.user.id)
+        member = guild.get_member(interaction.user.id)
         if member and nome_familia != current_family_name:
             nick_success, nick_msg = await update_member_nickname(member, nome_familia)
             if nick_success:
@@ -1529,13 +1562,13 @@ async def atualizar(
         old_ranking = None
         try:
             logger.info(f"Buscando ranking para user_id={user_id}, gs_total={gs_total}")
-            new_ranking = await get_player_ranking_position(interaction.guild, user_id, gs_total)
+            new_ranking = await get_player_ranking_position(guild, user_id, gs_total)
             logger.info(f"Ranking encontrado: {new_ranking}")
             
             # Buscar ranking antigo apenas se o GS mudou e queremos mostrar a diferença
             if old_gs is not None and old_gs != gs_total:
                 try:
-                    old_ranking = await get_player_ranking_position(interaction.guild, user_id, old_gs)
+                    old_ranking = await get_player_ranking_position(guild, user_id, old_gs)
                     logger.info(f"Ranking antigo encontrado: {old_ranking}")
                 except Exception as e:
                     logger.warning(f"Erro ao buscar ranking antigo: {e}")
@@ -1589,7 +1622,7 @@ async def atualizar(
             # Se o ranking não estiver disponível, adicionar mensagem informativa
             logger.warning(f"Ranking não disponível para user_id={user_id}")
             # Verificar se o usuário tem o cargo da guilda
-            member_check = interaction.guild.get_member(interaction.user.id)
+            member_check = guild.get_member(interaction.user.id)
             if member_check and has_guild_role(member_check):
                 embed.add_field(
                     name="🏆 Seu Ranking", 
