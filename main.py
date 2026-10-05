@@ -447,7 +447,7 @@ async def check_gs_update_reminders(guild: discord.Guild):
             
             embed.add_field(
                 name="📝 Como atualizar",
-                value="Use o comando `/atualizar` com seus valores atuais de AP, AAP, DP e linkgear.",
+                value="Use o comando `/atualizar` com seus valores atuais de AP, AAP e DP (o link do gear é opcional).",
                 inline=False
             )
             
@@ -555,7 +555,7 @@ async def send_notification_to_channel(bot, interaction, action_type, nome_famil
             embed.add_field(name="🔥 AAP", value=f"{aap}", inline=True)
             embed.add_field(name="🛡️ DP", value=f"{dp}", inline=True)
             embed.add_field(name="📊 GS Total", value=f"**{gs_total}** (MAX({ap}, {aap}) + {dp})", inline=False)
-            embed.add_field(name="🔗 Link Gear", value=linkgear, inline=False)
+            embed.add_field(name="🔗 Link Gear", value=linkgear or "Não informado", inline=False)
             embed.set_footer(text=f"{action_type.capitalize()} por {interaction.user.display_name}")
             
             await channel.send(embed=embed)
@@ -1201,7 +1201,7 @@ async def registro_manual(
     ap="Attack Power (AP) - Obrigatório",
     aap="Awakened Attack Power (AAP) - Obrigatório",
     dp="Defense Power (DP) - Obrigatório",
-    linkgear="Link do gear - Obrigatório",
+    linkgear="Link do gear (opcional - se não informar, mantém o atual)",
     nome_familia="Nome da família do personagem (opcional se já cadastrado)",
     nome_personagem="Nome do personagem (opcional se já cadastrado)",
     classe_pvp="Classe PVP do personagem (opcional se já cadastrado, digite para buscar)"
@@ -1212,7 +1212,7 @@ async def atualizar(
     ap: int,
     aap: int,
     dp: int,
-    linkgear: str,
+    linkgear: str = None,
     nome_familia: str = None,
     nome_personagem: str = None,
     classe_pvp: str = None
@@ -1241,13 +1241,9 @@ async def atualizar(
             )
             return
         
-        # Validar linkgear
-        if not linkgear or linkgear.strip() == "":
-            await interaction.followup.send(
-                "❌ O link do gear é obrigatório!",
-                ephemeral=True
-            )
-            return
+        # Linkgear é opcional: se não informado, mantém o link já cadastrado
+        if linkgear is not None and linkgear.strip() == "":
+            linkgear = None
         
         user_id = str(interaction.user.id)
 
@@ -1301,7 +1297,7 @@ async def atualizar(
                     )
                     dm_embed.add_field(
                         name="📝 Exemplo",
-                        value=f"`/atualizar ap:300 aap:280 dp:400 linkgear:https://... nome_personagem:NovoNome classe_pvp:{classe_pvp}`",
+                        value=f"`/atualizar ap:300 aap:280 dp:400 nome_personagem:NovoNome classe_pvp:{classe_pvp}`",
                         inline=False
                     )
                     await interaction.user.send(embed=dm_embed)
@@ -1312,7 +1308,7 @@ async def atualizar(
                     f"❌ **Nome do personagem obrigatório!**\n\n"
                     f"Você está mudando de classe de **{current_class_pvp}** para **{classe_pvp}**.\n"
                     f"Como você está mudando para um personagem diferente, é **obrigatório** fornecer o nome do novo personagem.\n\n"
-                    f"**Exemplo:** `/atualizar ap:{ap} aap:{aap} dp:{dp} linkgear:{linkgear} nome_personagem:NovoNome classe_pvp:{classe_pvp}`",
+                    f"**Exemplo:** `/atualizar ap:{ap} aap:{aap} dp:{dp} nome_personagem:NovoNome classe_pvp:{classe_pvp}`",
                     ephemeral=True
                 )
                 return
@@ -1335,6 +1331,13 @@ async def atualizar(
                 old_aap = result[6] if len(result) > 6 else 0
                 old_dp = result[7] if len(result) > 7 else 0
             old_gs = calculate_gs(old_ap, old_aap, old_dp)
+            
+            # Se não informou o link, manter o já cadastrado
+            if linkgear is None:
+                if isinstance(result, dict):
+                    linkgear = result.get('linkgear')
+                else:
+                    linkgear = result[8] if len(result) > 8 else None
         
         # Atualizar gearscore PRIMEIRO (mais rápido)
         logger.info(f"Comando /atualizar executado por {interaction.user.display_name} (ID: {user_id}) - {nome_familia} ({classe_pvp}) - GS: {calculate_gs(ap, aap, dp)}")
@@ -1437,7 +1440,7 @@ async def atualizar(
                     inline=False
                 )
         
-        embed.add_field(name="🔗 Link Gear", value=linkgear, inline=False)
+        embed.add_field(name="🔗 Link Gear", value=linkgear or "Não informado", inline=False)
         
         if current_class_pvp != classe_pvp:
             embed.add_field(
@@ -6048,7 +6051,7 @@ async def admin_cobrar_atualizacao(interaction: discord.Interaction, dias: int =
                     + (f" (última atualização há **{days_since_update} dia(s)**)" if days_since_update is not None else "")
                     + ".\n\n"
                     f"📋 **Você pode usar `/atualizar` aqui mesmo, no privado do bot!**\n"
-                    f"Basta digitar `/atualizar` nesta conversa e preencher AP, AAP, DP e o link do gear.\n\n"
+                    f"Basta digitar `/atualizar` nesta conversa e preencher AP, AAP e DP (o link do gear é opcional).\n\n"
                     f"⚠️ Mesmo que você não tenha evoluído nada, atualize mesmo assim. "
                     f"Isso é necessário para o **controle interno da guilda**."
                 ),
