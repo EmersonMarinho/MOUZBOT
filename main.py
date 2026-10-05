@@ -5923,6 +5923,289 @@ async def admin_gs_desatualizados(interaction: discord.Interaction, dias: int = 
                 ephemeral=True
             )
 
+# Função helper para obter o registro mais recente de cada usuário (um por pessoa)
+def get_latest_record_per_user(records) -> dict:
+    """Retorna {user_id: dados} usando apenas o registro atualizado mais recentemente de cada usuário"""
+    latest = {}
+    for record in records:
+        if isinstance(record, dict):
+            data = {
+                'user_id': str(record.get('user_id', '')),
+                'family_name': record.get('family_name', 'N/A'),
+                'class_pvp': record.get('class_pvp', 'N/A'),
+                'ap': record.get('ap', 0) or 0,
+                'aap': record.get('aap', 0) or 0,
+                'dp': record.get('dp', 0) or 0,
+                'updated_at': record.get('updated_at')
+            }
+        else:
+            # Ordem: id(0), user_id(1), family_name(2), character_name(3), class_pvp(4), ap(5), aap(6), dp(7), linkgear(8), updated_at(9)
+            data = {
+                'user_id': str(record[1]),
+                'family_name': record[2] or 'N/A',
+                'class_pvp': record[4] or 'N/A',
+                'ap': record[5] or 0,
+                'aap': record[6] or 0,
+                'dp': record[7] or 0,
+                'updated_at': record[9] if len(record) > 9 else None
+            }
+        
+        updated_at = data['updated_at']
+        if isinstance(updated_at, str):
+            for fmt in ['%Y-%m-%d %H:%M:%S', '%Y-%m-%d %H:%M:%S.%f', '%Y-%m-%dT%H:%M:%S', '%Y-%m-%dT%H:%M:%S.%f']:
+                try:
+                    updated_at = datetime.strptime(updated_at.split('+')[0].split('Z')[0], fmt)
+                    break
+                except ValueError:
+                    continue
+            else:
+                updated_at = None
+        elif updated_at is not None and getattr(updated_at, 'tzinfo', None):
+            updated_at = updated_at.replace(tzinfo=None)
+        data['updated_at'] = updated_at
+        
+        if not data['user_id']:
+            continue
+        
+        current = latest.get(data['user_id'])
+        if current is None or (updated_at and (current['updated_at'] is None or updated_at > current['updated_at'])):
+            latest[data['user_id']] = data
+    
+    return latest
+
+@bot.tree.command(name="admin_cobrar_atualizacao", description="[ADMIN] Cobra via DM (urgente) quem não atualizou o GS nos últimos dias")
+@app_commands.describe(
+    dias="Quantidade de dias sem atualizar para cobrar (padrão: 3)"
+)
+async def admin_cobrar_atualizacao(interaction: discord.Interaction, dias: int = 3):
+    """Envia DM urgente da staff para membros que não atualizaram o GS nos últimos X dias"""
+    if not is_admin_user(interaction.user):
+        await interaction.response.send_message(
+            "❌ Apenas administradores podem usar este comando!",
+            ephemeral=True
+        )
+        return
+    
+    if dias < 1:
+        await interaction.response.send_message(
+            "❌ O número de dias deve ser maior ou igual a 1!",
+            ephemeral=True
+        )
+        return
+    
+    if not interaction.guild:
+        await interaction.response.send_message(
+            "❌ Este comando só pode ser usado em um servidor!",
+            ephemeral=True
+        )
+        return
+    
+    try:
+        await interaction.response.defer(ephemeral=True)
+        
+        guild_member_ids = await get_guild_member_ids(interaction.guild)
+        if not guild_member_ids:
+            await interaction.followup.send(
+                "❌ Nenhum membro com o cargo da guilda encontrado!",
+                ephemeral=True
+            )
+            return
+        
+        latest_records = get_latest_record_per_user(db.get_all_gearscores(valid_user_ids=guild_member_ids))
+        
+        now = datetime.now()
+        limit_date = now - timedelta(days=dias)
+        
+        outdated = []
+        for user_id, data in latest_records.items():
+            if data['updated_at'] and data['updated_at'] >= limit_date:
+                continue
+            member = interaction.guild.get_member(int(user_id))
+            if not member or not has_guild_role(member):
+                continue
+            outdated.append((member, data))
+        
+        if not outdated:
+            await interaction.followup.send(
+                f"✅ Todos os membros registrados atualizaram o GS nos últimos **{dias} dia(s)**!",
+                ephemeral=True
+            )
+            return
+        
+        sent = []
+        failed = []
+        
+        for member, data in outdated:
+            days_since_update = (now - data['updated_at']).days if data['updated_at'] else None
+            gs_total = calculate_gs(data['ap'], data['aap'], data['dp'])
+            
+            embed = discord.Embed(
+                title="🚨 URGENTE: Atualize seu Gearscore",
+                description=(
+                    f"Olá **{member.display_name}**!\n\n"
+                    f"A **staff da guilda** está pedindo, com **urgência**, que todos atualizem o gearscore.\n"
+                    f"Seu GS não foi atualizado nos últimos **{dias} dia(s)**"
+                    + (f" (última atualização há **{days_since_update} dia(s)**)" if days_since_update is not None else "")
+                    + ".\n\n"
+                    f"📋 **Você pode usar `/atualizar` aqui mesmo, no privado do bot!**\n"
+                    f"Basta digitar `/atualizar` nesta conversa e preencher AP, AAP, DP e o link do gear.\n\n"
+                    f"⚠️ Mesmo que você não tenha evoluído nada, atualize mesmo assim. "
+                    f"Isso é necessário para o **controle interno da guilda**."
+                ),
+                color=discord.Color.red(),
+                timestamp=discord.utils.utcnow()
+            )
+            embed.add_field(name="👤 Família", value=data['family_name'], inline=True)
+            embed.add_field(name="⚔️ Classe", value=data['class_pvp'], inline=True)
+            embed.add_field(name="📊 GS Atual", value=f"**{gs_total}**", inline=True)
+            if data['updated_at']:
+                embed.set_footer(text=f"Última atualização: {data['updated_at'].strftime('%d/%m/%Y às %H:%M')}")
+            
+            try:
+                await member.send(embed=embed)
+                sent.append((member, data))
+            except discord.Forbidden:
+                failed.append((member, data))
+            except Exception as e:
+                logger.error(f"Erro ao enviar cobrança de GS para {member.display_name} (ID: {member.id}): {e}")
+                failed.append((member, data))
+            
+            # Evitar rate limit do Discord ao enviar muitas DMs
+            await asyncio.sleep(1)
+        
+        embed = discord.Embed(
+            title=f"🚨 Cobrança de Atualização de GS ({dias}+ dias)",
+            description=f"Membros com cargo da guilda que **não atualizaram** o GS nos últimos **{dias} dia(s)** foram cobrados via DM.",
+            color=discord.Color.green() if not failed else discord.Color.orange(),
+            timestamp=discord.utils.utcnow()
+        )
+        embed.add_field(name="📋 Desatualizados", value=f"**{len(outdated)}**", inline=True)
+        embed.add_field(name="✅ DMs Enviadas", value=f"**{len(sent)}**", inline=True)
+        embed.add_field(name="❌ DM Fechada/Erro", value=f"**{len(failed)}**", inline=True)
+        
+        if failed:
+            failed_text = "\n".join(f"{m.mention} - {d['family_name']}" for m, d in failed)
+            if len(failed_text) > 1024:
+                failed_text = failed_text[:990].rsplit("\n", 1)[0] + f"\n... (total: {len(failed)})"
+            embed.add_field(
+                name="🚫 Não receberam a DM (cobrar no canal)",
+                value=failed_text,
+                inline=False
+            )
+        
+        embed.set_footer(text=f"Executado por {interaction.user.display_name}")
+        await interaction.followup.send(embed=embed, ephemeral=True)
+        
+        logger.info(f"Cobrança de GS ({dias}+ dias) por {interaction.user.display_name} (ID: {interaction.user.id}): {len(sent)} enviadas, {len(failed)} falhas")
+        
+    except Exception as e:
+        import traceback
+        logger.error(f"Erro ao cobrar atualização de GS: {traceback.format_exc()}")
+        if interaction.response.is_done():
+            await interaction.followup.send(f"❌ Erro ao cobrar atualização: {str(e)}", ephemeral=True)
+        else:
+            await interaction.response.send_message(f"❌ Erro ao cobrar atualização: {str(e)}", ephemeral=True)
+
+@bot.tree.command(name="media_gs", description="[ADMIN] Mostra a média de GS da guilda")
+async def media_gs(interaction: discord.Interaction):
+    """Mostra a média de GS da guilda (um registro por membro, o mais recente)"""
+    if not is_admin_user(interaction.user):
+        await interaction.response.send_message(
+            "❌ Apenas administradores podem usar este comando!",
+            ephemeral=True
+        )
+        return
+    
+    if not interaction.guild:
+        await interaction.response.send_message(
+            "❌ Este comando só pode ser usado em um servidor!",
+            ephemeral=True
+        )
+        return
+    
+    try:
+        await interaction.response.defer(ephemeral=True)
+        
+        guild_member_ids = await get_guild_member_ids(interaction.guild)
+        if not guild_member_ids:
+            await interaction.followup.send(
+                "❌ Nenhum membro com o cargo da guilda encontrado!",
+                ephemeral=True
+            )
+            return
+        
+        latest_records = get_latest_record_per_user(db.get_all_gearscores(valid_user_ids=guild_member_ids))
+        
+        players = []
+        for user_id, data in latest_records.items():
+            member = interaction.guild.get_member(int(user_id))
+            if not member or not has_guild_role(member):
+                continue
+            data['gs'] = calculate_gs(data['ap'], data['aap'], data['dp'])
+            players.append(data)
+        
+        if not players:
+            await interaction.followup.send(
+                "❌ Nenhum gearscore registrado entre os membros da guilda!",
+                ephemeral=True
+            )
+            return
+        
+        total = len(players)
+        gs_values = sorted(p['gs'] for p in players)
+        avg_gs = sum(gs_values) / total
+        mid = total // 2
+        median_gs = gs_values[mid] if total % 2 else (gs_values[mid - 1] + gs_values[mid]) / 2
+        avg_ap = sum(p['ap'] for p in players) / total
+        avg_aap = sum(p['aap'] for p in players) / total
+        avg_dp = sum(p['dp'] for p in players) / total
+        
+        top = max(players, key=lambda p: p['gs'])
+        bottom = min(players, key=lambda p: p['gs'])
+        above = sum(1 for g in gs_values if g >= avg_gs)
+        
+        embed = discord.Embed(
+            title="📊 Média de GS da Guilda",
+            description=f"## {avg_gs:.1f} GS\nBaseado em **{total}** membros com cargo da guilda e GS registrado.",
+            color=discord.Color.blue(),
+            timestamp=discord.utils.utcnow()
+        )
+        embed.add_field(name="📈 Mediana", value=f"**{median_gs:.0f}**", inline=True)
+        embed.add_field(name="🔝 Maior GS", value=f"**{top['gs']}** ({top['family_name']})", inline=True)
+        embed.add_field(name="🔻 Menor GS", value=f"**{bottom['gs']}** ({bottom['family_name']})", inline=True)
+        embed.add_field(name="⚔️ AP Médio", value=f"**{avg_ap:.1f}**", inline=True)
+        embed.add_field(name="🔥 AAP Médio", value=f"**{avg_aap:.1f}**", inline=True)
+        embed.add_field(name="🛡️ DP Médio", value=f"**{avg_dp:.1f}**", inline=True)
+        embed.add_field(
+            name="👥 Distribuição",
+            value=f"Na média ou acima: **{above}** | Abaixo da média: **{total - above}**",
+            inline=False
+        )
+        
+        # Média por classe
+        classes = {}
+        for p in players:
+            classes.setdefault(p['class_pvp'], []).append(p['gs'])
+        class_lines = [
+            f"**{name}**: {sum(v) / len(v):.0f} GS ({len(v)})"
+            for name, v in sorted(classes.items(), key=lambda kv: sum(kv[1]) / len(kv[1]), reverse=True)
+        ]
+        class_text = "\n".join(class_lines)
+        if len(class_text) > 1024:
+            class_text = class_text[:990].rsplit("\n", 1)[0] + "\n..."
+        embed.add_field(name="🎭 Média por Classe (membros)", value=class_text, inline=False)
+        
+        embed.set_footer(text=f"Consultado por {interaction.user.display_name}")
+        await interaction.followup.send(embed=embed, ephemeral=True)
+        
+    except Exception as e:
+        import traceback
+        logger.error(f"Erro ao calcular média de GS: {traceback.format_exc()}")
+        if interaction.response.is_done():
+            await interaction.followup.send(f"❌ Erro ao calcular média de GS: {str(e)}", ephemeral=True)
+        else:
+            await interaction.response.send_message(f"❌ Erro ao calcular média de GS: {str(e)}", ephemeral=True)
+
 if __name__ == "__main__":
     if not DISCORD_TOKEN:
         logger.critical("❌ Erro: DISCORD_TOKEN não encontrado no arquivo .env")
