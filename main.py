@@ -2775,7 +2775,7 @@ async def stats(interaction: discord.Interaction):
             )
             return
         
-        await interaction.response.defer(ephemeral=False)  # Não ephemeral para mostrar para todos
+        await interaction.response.defer(ephemeral=True)  # Só o admin que executou vê
         
         valid_user_ids = await get_guild_member_ids(interaction.guild)
         results = db.get_all_gearscores(valid_user_ids=valid_user_ids)
@@ -2985,10 +2985,7 @@ async def stats(interaction: discord.Interaction):
             
             embed.set_footer(text=f"Total: {len(sorted_results)} membros | Página {page + 1}/{total_pages}")
             
-            if page == 0:
-                await interaction.followup.send(embed=embed)
-            else:
-                await interaction.channel.send(embed=embed)
+            await interaction.followup.send(embed=embed, ephemeral=True)
         
     except Exception as e:
         if interaction.response.is_done():
