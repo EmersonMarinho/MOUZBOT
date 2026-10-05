@@ -7,7 +7,7 @@ import asyncio
 import logging
 from datetime import datetime
 from pytz import timezone
-from config import DISCORD_TOKEN, BDO_CLASSES, DATABASE_NAME, DATABASE_URL, ALLOWED_DM_ROLES, NOTIFICATION_CHANNEL_ID, GUILD_MEMBER_ROLE_ID, DM_REPORT_CHANNEL_ID, LIST_CHANNEL_ID, MOVE_LOG_CHANNEL_ID, REGISTERED_ROLE_ID, UNREGISTERED_ROLE_ID, GS_UPDATE_REMINDER_DAYS, GS_REMINDER_CHECK_HOUR, REGISTRO_NAG_INTERVAL_MINUTES, ADMIN_USER_IDS, ADMIN_ROLE_IDS
+from config import DISCORD_TOKEN, BDO_CLASSES, DATABASE_NAME, DATABASE_URL, ALLOWED_DM_ROLES, NOTIFICATION_CHANNEL_ID, GUILD_MEMBER_ROLE_ID, DM_REPORT_CHANNEL_ID, LIST_CHANNEL_ID, MOVE_LOG_CHANNEL_ID, REGISTERED_ROLE_ID, UNREGISTERED_ROLE_ID, GS_UPDATE_REMINDER_DAYS, GS_REMINDER_CHECK_HOUR, ADMIN_USER_IDS, ADMIN_ROLE_IDS
 from datetime import timedelta
 import hp_efetivo
 # Importar o banco de dados apropriado
@@ -524,88 +524,6 @@ async def before_eventos_reset():
     await bot.wait_until_ready()
     logger.info("Task de reset mensal de eventos iniciada")
 
-# IDs de membros com DM fechada já reportados à staff (evita repetir o aviso a cada execução)
-registro_nag_dm_blocked = set()
-
-async def send_registro_nags(guild: discord.Guild):
-    """Envia DM para membros com cargo da guilda que não têm registro de GS e reporta DMs fechadas"""
-    guild_member_ids = await get_guild_member_ids(guild)
-    if not guild_member_ids:
-        return 0, 0
-
-    registered_ids = set(get_latest_record_per_user(db.get_all_gearscores(valid_user_ids=guild_member_ids)))
-
-    sent = 0
-    newly_blocked = []
-
-    for user_id in guild_member_ids - registered_ids:
-        member = guild.get_member(int(user_id))
-        if not member or member.bot:
-            continue
-
-        embed = discord.Embed(
-            title="🚨 OBRIGATÓRIO: Faça seu registro de Gearscore",
-            description=(
-                f"Olá **{member.display_name}**!\n\n"
-                f"Você faz parte da guilda e **ainda não tem registro de gearscore**.\n"
-                f"Se a staff está pedindo, é porque é **importante**.\n\n"
-                f"📋 **Use `/registro` no servidor da guilda** e preencha família, personagem, classe, AP, AAP, DP e o link do gear.\n\n"
-                f"⏰ Você vai receber esta mensagem a cada **{REGISTRO_NAG_INTERVAL_MINUTES} minutos** até fazer o registro.\n"
-                f"🚫 Bloquear o bot ou fechar a DM **não resolve**: a staff é avisada automaticamente."
-            ),
-            color=discord.Color.red(),
-            timestamp=discord.utils.utcnow()
-        )
-
-        try:
-            await member.send(embed=embed)
-            sent += 1
-            registro_nag_dm_blocked.discard(member.id)
-        except discord.Forbidden:
-            if member.id not in registro_nag_dm_blocked:
-                registro_nag_dm_blocked.add(member.id)
-                newly_blocked.append(member)
-        except Exception as e:
-            logger.error(f"Erro ao enviar cobrança de registro para {member.display_name} (ID: {member.id}): {e}")
-
-        # Evitar rate limit do Discord ao enviar muitas DMs
-        await asyncio.sleep(1)
-
-    if newly_blocked:
-        try:
-            report_channel = bot.get_channel(DM_REPORT_CHANNEL_ID) or await bot.fetch_channel(DM_REPORT_CHANNEL_ID)
-            blocked_text = "\n".join(f"{m.mention} ({m.display_name})" for m in newly_blocked)
-            if len(blocked_text) > 1024:
-                blocked_text = blocked_text[:990].rsplit("\n", 1)[0] + f"\n... (total: {len(newly_blocked)})"
-            embed = discord.Embed(
-                title="🚫 Sem registro e com DM bloqueada/fechada",
-                description="Estes membros da guilda **não fizeram `/registro`** e **não estão recebendo a cobrança por DM** (bloquearam o bot ou fecharam a DM).",
-                color=discord.Color.dark_red(),
-                timestamp=discord.utils.utcnow()
-            )
-            embed.add_field(name=f"👥 Membros ({len(newly_blocked)})", value=blocked_text, inline=False)
-            embed.set_footer(text="Cada membro é reportado uma vez (até o bot reiniciar)")
-            await report_channel.send(embed=embed)
-        except Exception as e:
-            logger.error(f"Erro ao reportar DMs bloqueadas no canal (ID: {DM_REPORT_CHANNEL_ID}): {e}")
-
-    return sent, len(newly_blocked)
-
-# Task que cobra o /registro de quem tem cargo da guilda e ainda não registrou
-@tasks.loop(minutes=REGISTRO_NAG_INTERVAL_MINUTES)
-async def registro_nag_task():
-    for guild in bot.guilds:
-        try:
-            sent, blocked = await send_registro_nags(guild)
-            logger.info(f"Cobrança de registro em {guild.name}: {sent} DMs enviadas, {blocked} novas DMs bloqueadas reportadas")
-        except Exception as e:
-            logger.error(f"Erro na cobrança de registro em {guild.name}: {e}")
-
-@registro_nag_task.before_loop
-async def before_registro_nag():
-    """Aguarda o bot estar pronto antes de iniciar a task"""
-    await bot.wait_until_ready()
-
 # Função helper para enviar notificação ao canal
 async def send_notification_to_channel(bot, interaction, action_type, nome_familia, classe_pvp, ap, aap, dp, linkgear):
     """Envia notificação de registro/atualização para o canal especificado"""
@@ -759,11 +677,6 @@ async def on_ready():
     if not eventos_reset_task.is_running():
         eventos_reset_task.start()
         logger.info('Task de reset mensal de eventos iniciada (executa no dia 1 de cada mês)')
-
-    # Iniciar task de cobrança de /registro
-    if not registro_nag_task.is_running():
-        registro_nag_task.start()
-        logger.info(f'Task de cobrança de registro iniciada (a cada {REGISTRO_NAG_INTERVAL_MINUTES} minutos)')
 
 @bot.event
 async def on_member_update(before: discord.Member, after: discord.Member):
@@ -6374,7 +6287,7 @@ async def admin_limpar_inativos(interaction: discord.Interaction, dias: int = 20
                 description=(
                     f"**{len(inactive)}** membro(s) teriam o registro **e o histórico** apagados.\n\n"
                     f"Para executar, rode de novo com `confirmar: CONFIRMAR`.\n"
-                    f"⚠️ Esta ação é **irreversível**. Depois disso eles passam a ser cobrados por DM até fazerem `/registro`."
+                    f"⚠️ Esta ação é **irreversível**. Depois disso eles precisam fazer `/registro` de novo."
                 ),
                 color=discord.Color.orange(),
                 timestamp=discord.utils.utcnow()
