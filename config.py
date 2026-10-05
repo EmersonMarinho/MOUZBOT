@@ -61,6 +61,9 @@ UNREGISTERED_ROLE_ID = 1442889439717359728
 GS_UPDATE_REMINDER_DAYS = 10  # Dias sem atualizar para enviar lembrete
 GS_REMINDER_CHECK_HOUR = 12  # Hora do dia para verificar (12 = meio-dia)
 
+# Intervalo (em minutos) da cobrança automática por DM de quem tem o cargo da guilda e não fez /registro
+REGISTRO_NAG_INTERVAL_MINUTES = 30
+
 
 # Lista de classes do Black Desert Online (ordem alfabética)
 # Total: 31 classes - Discord mostra 25, usuário deve DIGITAR para filtrar
