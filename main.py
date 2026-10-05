@@ -792,7 +792,7 @@ async def classe_autocomplete(
     ap="Attack Power (AP)",
     aap="Awakened Attack Power (AAP)",
     dp="Defense Power (DP)",
-    linkgear="Link do gear (obrigatório)"
+    linkgear="Link do gear (opcional)"
 )
 @app_commands.autocomplete(classe_pvp=classe_autocomplete)
 async def registro(
@@ -803,7 +803,7 @@ async def registro(
     ap: int,
     aap: int,
     dp: int,
-    linkgear: str
+    linkgear: str = None
 ):
     # Deferir resposta IMEDIATAMENTE para evitar timeout
     try:
@@ -838,13 +838,8 @@ async def registro(
             )
             return
         
-        # Validar linkgear
-        if not linkgear or linkgear.strip() == "":
-            await interaction.followup.send(
-                "❌ O link do gear é obrigatório!",
-                ephemeral=True
-            )
-            return
+        # Linkgear é opcional (a coluna no banco não aceita nulo, então salva vazio)
+        linkgear = (linkgear or "").strip()
         
         # Validar classe PVP
         if classe_pvp not in BDO_CLASSES:
@@ -949,7 +944,7 @@ async def registro(
             
             embed.add_field(name="🏆 Seu Ranking", value=ranking_value, inline=False)
         
-        embed.add_field(name="🔗 Link Gear", value=linkgear, inline=False)
+        embed.add_field(name="🔗 Link Gear", value=linkgear or "Não informado", inline=False)
         
         if role_added:
             embed.add_field(name="🎖️ Cargo", value="Cargo da guilda atribuído com sucesso!", inline=False)
@@ -1701,7 +1696,7 @@ async def generate_profile_embed(interaction: discord.Interaction, target_user: 
     
     embed.add_field(
         name="🔗 Link Gear",
-        value=f"[Clique aqui]({linkgear})" if linkgear != 'N/A' and linkgear.startswith('http') else linkgear,
+        value=f"[Clique aqui]({linkgear})" if linkgear != 'N/A' and linkgear.startswith('http') else (linkgear or "Não informado"),
         inline=True
     )
     
@@ -3213,7 +3208,7 @@ async def membros_classe(interaction: discord.Interaction, classe: str):
             # Criar texto do membro
             member_info = f"**GS Total:** {gs_total}\n"
             member_info += f"⚔️ AP: {ap} | 🔥 AAP: {aap} | 🛡️ DP: {dp}\n"
-            member_info += f"🔗 **Link Gear:** {linkgear}\n"
+            member_info += f"🔗 **Link Gear:** {linkgear or 'Não informado'}\n"
             member_info += f"📅 **Última atualização:** {date_str}"
             
             # Adicionar campo (limite de 25 campos por embed do Discord)
@@ -3334,7 +3329,7 @@ async def gearscore_dm(interaction: discord.Interaction):
         embed.add_field(name="🔥 AAP", value=f"{aap}", inline=True)
         embed.add_field(name="🛡️ DP", value=f"{dp}", inline=True)
         embed.add_field(name="📊 GS Total", value=f"**{gs_total}** (MAX({ap}, {aap}) + {dp})", inline=False)
-        embed.add_field(name="🔗 Link Gear", value=linkgear, inline=False)
+        embed.add_field(name="🔗 Link Gear", value=linkgear or "Não informado", inline=False)
         embed.set_footer(text=f"Última atualização: {updated_at}")
         
         await interaction.user.send(embed=embed)
@@ -5578,7 +5573,7 @@ async def analise_classe(interaction: discord.Interaction, classe: str):
                 # Criar texto do membro
                 member_info = f"**GS:** {gs_total}\n"
                 member_info += f"⚔️ AP: {ap} | 🔥 AAP: {aap} | 🛡️ DP: {dp}\n"
-                member_info += f"🔗 **Link Gear:** {linkgear}"
+                member_info += f"🔗 **Link Gear:** {linkgear or 'Não informado'}"
                 
                 # Adicionar campo (limite de 25 campos por embed do Discord)
                 if len(report_embed.fields) < 25:
