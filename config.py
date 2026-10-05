@@ -57,6 +57,16 @@ REGISTERED_ROLE_ID = 1442888990997876817
 # ID do cargo "Não Registrado" - dado a membros da guilda que ainda não fizeram registro
 UNREGISTERED_ROLE_ID = 1442889439717359728
 
+# ID do cargo "Amigo" - dado a quem tinha o cargo da guilda mas não está mais na guilda no jogo
+FRIEND_ROLE_ID = 1412707507171889172
+
+# Guildas do jogo (perfil público no site oficial) usadas para verificar quem ainda está na guilda
+BDO_GUILD_NAMES = ["MOUZ", "Manifest"]
+BDO_GUILD_REGION = "SA"
+
+# ID do canal com o painel e os cards de aprovação de quem saiu da guilda
+GUILD_CHECK_CHANNEL_ID = 1556745244995883030
+
 # Configurações de lembrete automático de atualização de GS
 GS_UPDATE_REMINDER_DAYS = 10  # Dias sem atualizar para enviar lembrete
 GS_REMINDER_CHECK_HOUR = 12  # Hora do dia para verificar (12 = meio-dia)

@@ -4,10 +4,13 @@ from discord.ext import commands, tasks
 import os
 import io
 import asyncio
+import re
+import html
+import aiohttp
 import logging
 from datetime import datetime
 from pytz import timezone
-from config import DISCORD_TOKEN, BDO_CLASSES, DATABASE_NAME, DATABASE_URL, ALLOWED_DM_ROLES, NOTIFICATION_CHANNEL_ID, GUILD_MEMBER_ROLE_ID, DM_REPORT_CHANNEL_ID, LIST_CHANNEL_ID, MOVE_LOG_CHANNEL_ID, REGISTERED_ROLE_ID, UNREGISTERED_ROLE_ID, GS_UPDATE_REMINDER_DAYS, GS_REMINDER_CHECK_HOUR, ADMIN_USER_IDS, ADMIN_ROLE_IDS
+from config import DISCORD_TOKEN, BDO_CLASSES, DATABASE_NAME, DATABASE_URL, ALLOWED_DM_ROLES, NOTIFICATION_CHANNEL_ID, GUILD_MEMBER_ROLE_ID, DM_REPORT_CHANNEL_ID, LIST_CHANNEL_ID, MOVE_LOG_CHANNEL_ID, REGISTERED_ROLE_ID, UNREGISTERED_ROLE_ID, GS_UPDATE_REMINDER_DAYS, GS_REMINDER_CHECK_HOUR, ADMIN_USER_IDS, ADMIN_ROLE_IDS, FRIEND_ROLE_ID, BDO_GUILD_NAMES, BDO_GUILD_REGION, GUILD_CHECK_CHANNEL_ID
 from datetime import timedelta
 import hp_efetivo
 # Importar o banco de dados apropriado
@@ -645,7 +648,10 @@ async def on_ready():
         logger.info(f'Sincronizados {len(synced)} comando(s) slash')
     except Exception as e:
         logger.error(f'Erro ao sincronizar comandos: {e}')
-    
+
+    # Reativar o botão dos painéis de verificação da guilda já postados
+    bot.add_view(GuildCheckPanelView())
+
     # Log de configuração de administradores
     if ADMIN_USER_IDS:
         logger.info(f'[ADMIN] ADMIN_USER_IDS carregado: {ADMIN_USER_IDS}')
@@ -6329,6 +6335,288 @@ async def admin_limpar_inativos(interaction: discord.Interaction, dias: int = 20
             await interaction.followup.send(f"❌ Erro ao limpar inativos: {str(e)}", ephemeral=True)
         else:
             await interaction.response.send_message(f"❌ Erro ao limpar inativos: {str(e)}", ephemeral=True)
+
+# ==================== VERIFICAÇÃO DE QUEM SAIU DA GUILDA NO JOGO ====================
+
+GUILD_PROFILE_URL = "https://www.sa.playblackdesert.com/pt-BR/Adventure/Guild/GuildProfile"
+
+async def fetch_bdo_guild_families(session: aiohttp.ClientSession, guild_name: str) -> set:
+    """
+    Busca os nomes de família da guilda no perfil público do site oficial.
+    Lança ValueError se a lista não puder ser lida por completo (evita remover cargos por engano).
+    """
+    params = {"guildName": guild_name, "region": BDO_GUILD_REGION}
+    async with session.get(GUILD_PROFILE_URL, params=params, timeout=aiohttp.ClientTimeout(total=30)) as resp:
+        if resp.status != 200:
+            raise ValueError(f"site respondeu HTTP {resp.status}")
+        page = await resp.text()
+
+    # A lista de membros fica em "adventure_list_table"; antes dela só aparece o mestre
+    start = page.find("adventure_list_table")
+    if start == -1:
+        raise ValueError("lista de membros não encontrada (guilda privada ou o site mudou)")
+
+    families = {
+        html.unescape(name).strip()
+        for name in re.findall(r'profileTarget=[^"]*"[^>]*>([^<]+)</a>', page[start:])
+    }
+    families.discard("")
+    if not families:
+        raise ValueError("nenhum membro encontrado na página")
+
+    # Conferir com o total de membros que o próprio site mostra
+    total = re.search(r'<span class="title">Membros</span>\s*<span class="desc">\s*<span>\s*<em>(\d+)</em>', page)
+    if total and int(total.group(1)) != len(families):
+        raise ValueError(f"o site mostra {total.group(1)} membros mas só {len(families)} foram lidos")
+
+    return families
+
+def member_name_tokens(member: discord.Member, registered_family: str = None) -> set:
+    """Nomes possíveis do membro (família registrada, apelido, nome global e usuário), em minúsculas"""
+    tokens = set()
+    for name in (registered_family, member.nick, member.global_name, member.name):
+        if not name:
+            continue
+        tokens.add(name.strip().lower())
+        # Apelidos tipo "Knowles | Musa" ou "[MOUZ] Knowles": considerar cada palavra
+        tokens.update(word.lower() for word in re.findall(r'[A-Za-z0-9]+', name))
+    return tokens
+
+def has_role_above_member_role(member: discord.Member, member_role: discord.Role) -> bool:
+    """True se o membro tem algum cargo acima do cargo Membro na hierarquia (Staff, Officer, etc.)"""
+    ignored = {REGISTERED_ROLE_ID, UNREGISTERED_ROLE_ID, FRIEND_ROLE_ID}
+    return any(role > member_role and role.id not in ignored for role in member.roles)
+
+guild_check_lock = asyncio.Lock()
+
+# Botões dos cards de aprovação: "gdep:<acao>:<user_id>" (tratados em on_interaction, sobrevivem a reinícios)
+GUILD_DEPARTURE_PREFIX = "gdep:"
+
+def departure_card_view(user_id: int) -> discord.ui.View:
+    view = discord.ui.View(timeout=None)
+    view.add_item(discord.ui.Button(label="Saiu - dar Amigo", emoji="👋", style=discord.ButtonStyle.danger, custom_id=f"{GUILD_DEPARTURE_PREFIX}approve:{user_id}"))
+    view.add_item(discord.ui.Button(label="Não saiu", emoji="✋", style=discord.ButtonStyle.secondary, custom_id=f"{GUILD_DEPARTURE_PREFIX}deny:{user_id}"))
+    return view
+
+async def get_pending_departure_ids(channel: discord.TextChannel) -> set:
+    """IDs dos membros que já têm card aguardando aprovação no canal"""
+    pending = set()
+    async for message in channel.history(limit=500):
+        if message.author.id != bot.user.id:
+            continue
+        for row in message.components:
+            for item in getattr(row, 'children', []):
+                custom_id = getattr(item, 'custom_id', None) or ''
+                if custom_id.startswith(f"{GUILD_DEPARTURE_PREFIX}approve:"):
+                    pending.add(int(custom_id.rsplit(':', 1)[1]))
+    return pending
+
+async def run_guild_departure_check(guild: discord.Guild, channel: discord.TextChannel) -> dict:
+    """Compara quem tem o cargo Membro com as guildas do jogo e posta um card de aprovação para quem não está em nenhuma"""
+    member_role = guild.get_role(GUILD_MEMBER_ROLE_ID)
+    if not member_role or not guild.get_role(FRIEND_ROLE_ID):
+        raise ValueError("cargo Membro ou Amigo não encontrado no servidor")
+    
+    game_families = set()
+    async with aiohttp.ClientSession(headers={"User-Agent": "Mozilla/5.0"}) as session:
+        for guild_name in BDO_GUILD_NAMES:
+            try:
+                families = await fetch_bdo_guild_families(session, guild_name)
+            except Exception as e:
+                raise ValueError(f"não consegui ler a guilda {guild_name}: {e}. Nenhum card foi criado.")
+            game_families.update(f.lower() for f in families)
+    
+    latest_records = get_latest_record_per_user(db.get_all_gearscores(valid_user_ids={str(m.id) for m in member_role.members}))
+    pending_ids = await get_pending_departure_ids(channel)
+    kept_ids = db.get_guild_departure_keep_ids()
+    
+    result = {'game_families': len(game_families), 'new': 0, 'pending': 0, 'kept': 0, 'skipped_high_role': 0}
+    
+    for member in member_role.members:
+        if member.bot:
+            continue
+        if has_role_above_member_role(member, member_role):
+            result['skipped_high_role'] += 1
+            continue
+        
+        registered_family = latest_records.get(str(member.id), {}).get('family_name')
+        if member_name_tokens(member, registered_family) & game_families:
+            continue
+        
+        if member.id in pending_ids:
+            result['pending'] += 1
+            continue
+        
+        if str(member.id) in kept_ids:
+            result['kept'] += 1
+            continue
+        
+        embed = discord.Embed(
+            title="❓ Saiu da guilda?",
+            description=(
+                f"{member.mention} tem o cargo <@&{GUILD_MEMBER_ROLE_ID}> mas **não foi encontrado** "
+                f"nas guildas **{' + '.join(BDO_GUILD_NAMES)}** do jogo."
+            ),
+            color=discord.Color.orange(),
+            timestamp=discord.utils.utcnow()
+        )
+        embed.add_field(name="👤 Família (/registro)", value=registered_family or "Sem registro", inline=True)
+        embed.add_field(name="✏️ Apelido no Discord", value=member.display_name, inline=True)
+        embed.add_field(name="🆔 Usuário", value=member.name, inline=True)
+        embed.set_footer(text=f"Aprovar: perde o cargo de membro e recebe Amigo | ID: {member.id}")
+        await channel.send(embed=embed, view=departure_card_view(member.id))
+        result['new'] += 1
+        await asyncio.sleep(0.5)
+    
+    return result
+
+async def handle_departure_card(interaction: discord.Interaction, action: str, user_id: int):
+    """Trata o clique em Saiu / Não saiu de um card de aprovação"""
+    if not interaction.guild or not is_admin_user(interaction.user):
+        await interaction.response.send_message("❌ Apenas administradores podem aprovar!", ephemeral=True)
+        return
+    
+    embed = interaction.message.embeds[0] if interaction.message.embeds else discord.Embed(title="Saiu da guilda?")
+    member = interaction.guild.get_member(user_id)
+    
+    if action == "deny":
+        db.add_guild_departure_keep(user_id, interaction.user.id)
+        embed.title = "✋ Mantido na guilda"
+        embed.color = discord.Color.light_grey()
+        embed.add_field(
+            name="Decisão",
+            value=f"Mantido por {interaction.user.mention}. Não aparece mais nas verificações (para voltar: `/admin_guilda_reverificar`).",
+            inline=False
+        )
+        logger.info(f"Saída da guilda negada por {interaction.user.display_name} (ID: {interaction.user.id}) para user_id {user_id}")
+    elif not member:
+        embed.title = "🚪 Não está mais no servidor"
+        embed.color = discord.Color.light_grey()
+        embed.add_field(name="Decisão", value=f"Fechado por {interaction.user.mention} (membro saiu do Discord)", inline=False)
+    else:
+        member_role = interaction.guild.get_role(GUILD_MEMBER_ROLE_ID)
+        friend_role = interaction.guild.get_role(FRIEND_ROLE_ID)
+        if not member_role or not friend_role:
+            await interaction.response.send_message("❌ Cargo Membro ou Amigo não encontrado no servidor!", ephemeral=True)
+            return
+        reason = f"Saiu da guilda no jogo (aprovado por {interaction.user.display_name})"
+        try:
+            await member.add_roles(friend_role, reason=reason)
+            if member_role in member.roles:
+                await member.remove_roles(member_role, reason=reason)
+        except (discord.Forbidden, discord.HTTPException) as e:
+            logger.error(f"Erro ao passar {member.display_name} (ID: {member.id}) para Amigo: {e}")
+            await interaction.response.send_message(
+                f"❌ Não consegui alterar os cargos de {member.mention} (o cargo do bot precisa estar acima de Membro e Amigo): {e}",
+                ephemeral=True
+            )
+            return
+        embed.title = "👋 Saiu da guilda"
+        embed.color = discord.Color.red()
+        embed.add_field(name="Decisão", value=f"Aprovado por {interaction.user.mention}: agora é <@&{FRIEND_ROLE_ID}>", inline=False)
+        logger.info(f"{member.display_name} (ID: {member.id}) passou para Amigo, aprovado por {interaction.user.display_name} (ID: {interaction.user.id})")
+    
+    await interaction.response.edit_message(embed=embed, view=None)
+
+@bot.listen('on_interaction')
+async def on_departure_card_interaction(interaction: discord.Interaction):
+    if interaction.type != discord.InteractionType.component:
+        return
+    custom_id = (interaction.data or {}).get('custom_id', '')
+    if not custom_id.startswith(GUILD_DEPARTURE_PREFIX):
+        return
+    try:
+        action, user_id = custom_id[len(GUILD_DEPARTURE_PREFIX):].split(':')
+        await handle_departure_card(interaction, action, int(user_id))
+    except Exception as e:
+        import traceback
+        logger.error(f"Erro no card de saída da guilda: {traceback.format_exc()}")
+        if not interaction.response.is_done():
+            await interaction.response.send_message(f"❌ Erro: {e}", ephemeral=True)
+
+class GuildCheckPanelView(discord.ui.View):
+    """Painel fixo (sobrevive a reinícios do bot) com o botão de verificação"""
+    def __init__(self):
+        super().__init__(timeout=None)
+    
+    @discord.ui.button(label="Verificar quem saiu", emoji="🔄", style=discord.ButtonStyle.primary, custom_id="guild_departure_check")
+    async def check(self, interaction: discord.Interaction, button: discord.ui.Button):
+        if not interaction.guild or not is_admin_user(interaction.user):
+            await interaction.response.send_message("❌ Apenas administradores podem usar este painel!", ephemeral=True)
+            return
+        
+        if guild_check_lock.locked():
+            await interaction.response.send_message("⏳ Já tem uma verificação rodando, aguarde.", ephemeral=True)
+            return
+        
+        await interaction.response.defer(ephemeral=True, thinking=True)
+        async with guild_check_lock:
+            try:
+                channel = bot.get_channel(GUILD_CHECK_CHANNEL_ID) or await bot.fetch_channel(GUILD_CHECK_CHANNEL_ID)
+                result = await run_guild_departure_check(interaction.guild, channel)
+            except ValueError as e:
+                await interaction.followup.send(f"❌ {e}", ephemeral=True)
+                return
+            except Exception as e:
+                import traceback
+                logger.error(f"Erro na verificação de saída da guilda: {traceback.format_exc()}")
+                await interaction.followup.send(f"❌ Erro na verificação: {e}", ephemeral=True)
+                return
+        
+        logger.info(f"Verificação de saída da guilda por {interaction.user.display_name} (ID: {interaction.user.id}): {result}")
+        await interaction.followup.send(
+            f"✅ Verificação concluída ({result['game_families']} famílias no jogo).\n"
+            f"• **{result['new']}** novo(s) card(s) de aprovação em <#{GUILD_CHECK_CHANNEL_ID}>\n"
+            f"• **{result['pending']}** já estavam aguardando aprovação\n"
+            f"• **{result['kept']}** ignorado(s) por já terem sido marcados como \"Não saiu\"\n"
+            f"• **{result['skipped_high_role']}** ignorado(s) por ter cargo acima de Membro",
+            ephemeral=True
+        )
+
+@bot.tree.command(name="admin_painel_guilda", description="[ADMIN] Cria o painel para verificar quem saiu da guilda no jogo")
+async def admin_painel_guilda(interaction: discord.Interaction):
+    if not is_admin_user(interaction.user):
+        await interaction.response.send_message("❌ Apenas administradores podem usar este comando!", ephemeral=True)
+        return
+    
+    if not interaction.guild:
+        await interaction.response.send_message("❌ Este comando só pode ser usado em um servidor!", ephemeral=True)
+        return
+    
+    embed = discord.Embed(
+        title="🛡️ Painel de Membros da Guilda",
+        description=(
+            f"Clique em **Verificar quem saiu** para comparar o Discord com as guildas "
+            f"**{' + '.join(BDO_GUILD_NAMES)}** no site oficial do Black Desert.\n\n"
+            f"• Só é verificado quem tem o cargo <@&{GUILD_MEMBER_ROLE_ID}> e **nenhum cargo acima** (Staff, Officer etc. são ignorados).\n"
+            f"• A comparação usa a família do `/registro` e o apelido do Discord.\n"
+            f"• Para cada um não encontrado aparece um card aqui: **Saiu** tira o cargo de membro e dá <@&{FRIEND_ROLE_ID}>, **Não saiu** mantém como está e o membro não aparece mais nas próximas verificações (use `/admin_guilda_reverificar` para voltar a verificar).\n"
+            f"• Se o site falhar, nenhum card é criado."
+        ),
+        color=discord.Color.blurple()
+    )
+    try:
+        channel = bot.get_channel(GUILD_CHECK_CHANNEL_ID) or await bot.fetch_channel(GUILD_CHECK_CHANNEL_ID)
+        await channel.send(embed=embed, view=GuildCheckPanelView())
+    except Exception as e:
+        await interaction.response.send_message(f"❌ Não consegui postar o painel em <#{GUILD_CHECK_CHANNEL_ID}>: {e}", ephemeral=True)
+        return
+    await interaction.response.send_message(f"✅ Painel criado em <#{GUILD_CHECK_CHANNEL_ID}>!", ephemeral=True)
+@bot.tree.command(name="admin_guilda_reverificar", description="[ADMIN] Volta a verificar um membro que foi marcado como \"Não saiu\"")
+@app_commands.describe(usuario="Membro marcado como \"Não saiu\" no painel da guilda")
+async def admin_guilda_reverificar(interaction: discord.Interaction, usuario: discord.Member):
+    if not is_admin_user(interaction.user):
+        await interaction.response.send_message("❌ Apenas administradores podem usar este comando!", ephemeral=True)
+        return
+    
+    if db.remove_guild_departure_keep(usuario.id):
+        logger.info(f"{usuario.display_name} (ID: {usuario.id}) voltou para a verificação de saída da guilda, por {interaction.user.display_name} (ID: {interaction.user.id})")
+        await interaction.response.send_message(
+            f"✅ {usuario.mention} volta a ser verificado. Se não estiver nas guildas do jogo, aparece um card na próxima verificação.",
+            ephemeral=True
+        )
+    else:
+        await interaction.response.send_message(f"ℹ️ {usuario.mention} não estava marcado como \"Não saiu\".", ephemeral=True)
 
 if __name__ == "__main__":
     if not DISCORD_TOKEN:

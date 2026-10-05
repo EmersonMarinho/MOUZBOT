@@ -289,6 +289,19 @@ class Database:
             print(f"Aviso ao criar índices de eventos: {e}")
             conn.rollback()
         
+        # Membros marcados como "Não saiu" na verificação de saída da guilda
+        try:
+            cursor.execute('''
+                CREATE TABLE IF NOT EXISTS guild_departure_keep (
+                    user_id TEXT PRIMARY KEY,
+                    decided_by TEXT,
+                    decided_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+                )
+            ''')
+        except Exception as e:
+            print(f"Aviso ao criar tabela guild_departure_keep: {e}")
+            conn.rollback()
+        
         try:
             conn.commit()
         except Exception as e:
@@ -980,3 +993,42 @@ class Database:
             cursor.close()
             conn.close()
             raise e
+    
+    def add_guild_departure_keep(self, user_id, decided_by):
+        """Marca o membro como "Não saiu" para não aparecer de novo na verificação de saída da guilda"""
+        conn = self.get_connection()
+        cursor = conn.cursor()
+        try:
+            cursor.execute('''
+                INSERT INTO guild_departure_keep (user_id, decided_by, decided_at)
+                VALUES (%s, %s, CURRENT_TIMESTAMP)
+                ON CONFLICT (user_id) DO UPDATE SET decided_by = EXCLUDED.decided_by, decided_at = CURRENT_TIMESTAMP
+            ''', (str(user_id), str(decided_by)))
+            conn.commit()
+        finally:
+            cursor.close()
+            conn.close()
+    
+    def remove_guild_departure_keep(self, user_id):
+        """Tira o membro da lista de "Não saiu". Retorna True se ele estava na lista"""
+        conn = self.get_connection()
+        cursor = conn.cursor()
+        try:
+            cursor.execute('DELETE FROM guild_departure_keep WHERE user_id = %s', (str(user_id),))
+            removed = cursor.rowcount > 0
+            conn.commit()
+            return removed
+        finally:
+            cursor.close()
+            conn.close()
+    
+    def get_guild_departure_keep_ids(self):
+        """IDs (str) dos membros marcados como "Não saiu"."""
+        conn = self.get_connection()
+        cursor = conn.cursor()
+        try:
+            cursor.execute('SELECT user_id FROM guild_departure_keep')
+            return {row[0] for row in cursor.fetchall()}
+        finally:
+            cursor.close()
+            conn.close()
