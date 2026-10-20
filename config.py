@@ -67,9 +67,8 @@ BDO_GUILD_REGION = "SA"
 # ID do canal com o painel e os cards de aprovação de quem saiu da guilda
 GUILD_CHECK_CHANNEL_ID = 1556745244995883030
 
-# Configurações de lembrete automático de atualização de GS
+# Configurações de lembrete de atualização de GS (envio manual via /admin_enviar_lembretes)
 GS_UPDATE_REMINDER_DAYS = 10  # Dias sem atualizar para enviar lembrete
-GS_REMINDER_CHECK_HOUR = 12  # Hora do dia para verificar (12 = meio-dia)
 
 
 # Lista de classes do Black Desert Online (ordem alfabética)

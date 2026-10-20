@@ -10,7 +10,7 @@ import aiohttp
 import logging
 from datetime import datetime
 from pytz import timezone
-from config import DISCORD_TOKEN, BDO_CLASSES, DATABASE_NAME, DATABASE_URL, ALLOWED_DM_ROLES, NOTIFICATION_CHANNEL_ID, GUILD_MEMBER_ROLE_ID, DM_REPORT_CHANNEL_ID, LIST_CHANNEL_ID, MOVE_LOG_CHANNEL_ID, REGISTERED_ROLE_ID, UNREGISTERED_ROLE_ID, GS_UPDATE_REMINDER_DAYS, GS_REMINDER_CHECK_HOUR, ADMIN_USER_IDS, ADMIN_ROLE_IDS, FRIEND_ROLE_ID, BDO_GUILD_NAMES, BDO_GUILD_REGION, GUILD_CHECK_CHANNEL_ID
+from config import DISCORD_TOKEN, BDO_CLASSES, DATABASE_NAME, DATABASE_URL, ALLOWED_DM_ROLES, NOTIFICATION_CHANNEL_ID, GUILD_MEMBER_ROLE_ID, DM_REPORT_CHANNEL_ID, LIST_CHANNEL_ID, MOVE_LOG_CHANNEL_ID, REGISTERED_ROLE_ID, UNREGISTERED_ROLE_ID, GS_UPDATE_REMINDER_DAYS, ADMIN_USER_IDS, ADMIN_ROLE_IDS, FRIEND_ROLE_ID, BDO_GUILD_NAMES, BDO_GUILD_REGION, GUILD_CHECK_CHANNEL_ID
 from datetime import timedelta
 import hp_efetivo
 # Importar o banco de dados apropriado
@@ -473,39 +473,6 @@ async def check_gs_update_reminders(guild: discord.Guild):
     
     return reminders_sent, errors
 
-# Task que roda diariamente para enviar lembretes
-@tasks.loop(hours=24)
-async def gs_reminder_task():
-    """Task que verifica e envia lembretes de atualização de GS diariamente"""
-    logger.info("Iniciando verificação de lembretes de atualização de GS...")
-    
-    for guild in bot.guilds:
-        try:
-            reminders_sent, errors = await check_gs_update_reminders(guild)
-            logger.info(f"Lembretes de GS para {guild.name}: {reminders_sent} enviados, {errors} erros")
-        except Exception as e:
-            logger.error(f"Erro ao processar lembretes para {guild.name}: {e}")
-    
-    logger.info("Verificação de lembretes de atualização de GS concluída")
-
-@gs_reminder_task.before_loop
-async def before_gs_reminder():
-    """Aguarda o bot estar pronto antes de iniciar a task"""
-    await bot.wait_until_ready()
-    
-    # Calcular tempo até a próxima execução no horário configurado
-    now = datetime.now()
-    target_time = now.replace(hour=GS_REMINDER_CHECK_HOUR, minute=0, second=0, microsecond=0)
-    
-    if now >= target_time:
-        # Se já passou do horário hoje, agendar para amanhã
-        target_time += timedelta(days=1)
-    
-    wait_seconds = (target_time - now).total_seconds()
-    logger.info(f"Task de lembrete de GS agendada para {target_time.strftime('%d/%m/%Y às %H:%M')} ({int(wait_seconds/3600)}h {int((wait_seconds%3600)/60)}min)")
-    
-    await discord.utils.sleep_until(target_time)
-
 # Task para limpar eventos do mês anterior (roda no dia 1 de cada mês)
 @tasks.loop(hours=24)
 async def eventos_reset_task():
@@ -673,11 +640,6 @@ async def on_ready():
             logger.info(f'Cargos de registro sincronizados para {guild.name} (ID: {guild.id})')
         except Exception as e:
             logger.error(f'Erro ao sincronizar cargos em {guild.name} (ID: {guild.id}): {e}')
-    
-    # Iniciar task de lembrete de atualização de GS
-    if not gs_reminder_task.is_running():
-        gs_reminder_task.start()
-        logger.info(f'Task de lembrete de GS iniciada (verificação a cada {GS_UPDATE_REMINDER_DAYS} dias)')
     
     # Iniciar task de reset mensal de eventos
     if not eventos_reset_task.is_running():
